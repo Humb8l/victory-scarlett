@@ -130,7 +130,7 @@ pub use PAIRED_BEFORE_WIDE as WAVE_PAIRED_BEFORE_WIDE;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_NAN_SLOT, SLOT_NAN, NAN_SLOTS, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -208,6 +208,16 @@ pub fn builder_fences() -> bool {
 pub fn bvh_walk() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
+}
+
+/// (Fox T, a meter) `VICTORY_NAN_METER=1`: every float a program stores through a typed view
+/// (images, typed buffers) or exports to a float colour target is looked at before any guard;
+/// a NaN or an infinity adds 1 to the program's count in the [`SLOT_NAN`] buffer (an atomic
+/// only then). What the program computes is unchanged. Part of the translation: the shader
+/// cache keys on it.
+pub fn nan_meter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_METER").is_some_and(|v| v == "1"))
 }
 
 /// (Fox T) `VICTORY_BVH_PAGE_REUSE=1`: the second 64 bytes of a 128-byte box node of a

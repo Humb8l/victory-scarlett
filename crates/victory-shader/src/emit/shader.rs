@@ -107,6 +107,17 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// (Fox T, `VICTORY_NAN_METER=1`) `RootType::Other` code of a user-data dword
+/// the host sets: the program's place in the [`SLOT_NAN`] buffer.
+pub const USER_NAN_SLOT: u32 = 0x107;
+/// (Fox T, `VICTORY_NAN_METER=1`) The root UAV `u<SLOT_NAN>` in
+/// [`ROOT_CBV_SPACE`]: per program ([`USER_NAN_SLOT`]) four dwords: NaNs and
+/// infinities stored through typed views (images, typed buffers), NaNs and
+/// infinities exported to float colour targets. Counted where they are made,
+/// before any guard.
+pub const SLOT_NAN: u8 = 250;
+/// Programs the [`SLOT_NAN`] buffer has room for.
+pub const NAN_SLOTS: u32 = 1 << 14;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

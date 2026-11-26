@@ -1256,6 +1256,11 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// (Fox T) Depth planes used since the last draw or dispatch before the
+    /// pass that gives them their twin's contents ([`HostList::twin_use`]):
+    /// for the log, and with `VICTORY_PLANE_NOW=1` the pass recorded at once
+    /// ([`HostList::planes_now`]).
+    plane_late: Mutex<Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1351,6 +1356,93 @@ fn card_split_line(frames: f64) {
         ms(4),
     );
 }
+
+/// (Fox T, diagnostics) What asks a refresh, for [`refresh_kinds_line`]:
+/// set before a call that may queue one ([`refresh_kind`]), back to "other"
+/// after each.
+#[cfg(feature = "diagnostics")]
+pub(crate) const REFRESH_KINDS: [&str; 10] = [
+    "root views (CBV, SRV as descriptor)",
+    "vertex buffers",
+    "index buffers",
+    "root UAVs",
+    "root SRVs as one-view tables",
+    "buffers picked from the heap",
+    "indirect arguments and counts",
+    "table buffer views",
+    "title memory by address",
+    "other",
+];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static REFRESH_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(9) };
+    /// Per kind: steps queued, their bytes, asks already queued in the list.
+    static REFRESH_COUNTS: std::cell::RefCell<([[u64; 3]; 10], u32)> = const { std::cell::RefCell::new(([[0; 3]; 10], 0)) };
+}
+
+#[cfg(feature = "diagnostics")]
+static REFRESH_SUMS: [[std::sync::atomic::AtomicU64; 3]; 10] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 10];
+
+/// (Fox T, diagnostics) The refreshes asked from here on are of kind `k`
+/// ([`REFRESH_KINDS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn refresh_kind(k: u8) {
+    REFRESH_KIND.set(k);
+}
+
+#[cfg(feature = "diagnostics")]
+fn refresh_asked(new: bool, len: usize) {
+    let k = usize::from(REFRESH_KIND.replace(9)).min(9);
+    REFRESH_COUNTS.with_borrow_mut(|(c, n)| {
+        if new {
+            c[k][0] += 1;
+            c[k][1] += len as u64;
+        } else {
+            c[k][2] += 1;
+        }
+        *n += 1;
+        if *n >= 2048 {
+            *n = 0;
+            for (i, row) in c.iter_mut().enumerate() {
+                for (j, v) in row.iter_mut().enumerate() {
+                    REFRESH_SUMS[i][j].fetch_add(std::mem::take(v), Ordering::Relaxed);
+                }
+            }
+        }
+    });
+}
+
+/// For the frame lines.
+#[cfg(feature = "diagnostics")]
+fn refresh_kinds_line(frames: f64) {
+    let f = frames.max(1.0);
+    let rows: Vec<String> = (0..10)
+        .filter_map(|i| {
+            let [n, b, again] = [0, 1, 2].map(|j| REFRESH_SUMS[i][j].swap(0, Ordering::Relaxed) as f64 / f);
+            (n + again > 0.0).then(|| {
+                format!("{}: {n:.0} steps, {:.1} MB ({:.0} KB each), {again:.0} already queued", REFRESH_KINDS[i], b / 1048576.0, b / 1024.0 / n.max(1.0))
+            })
+        })
+        .collect();
+    if !rows.is_empty() {
+        tracing::info!("refresh steps queued per frame by what asked them: {}", rows.join("; "));
+    }
+}
+
+/// (Fox T) `VICTORY_PLANE_NOW=1` (default off): a depth plane whose twin a
+/// list wrote is given the twin's contents (`HostList::pass_plane`) before
+/// the draw or dispatch that next uses it, not when the list closes: such a
+/// use read the plane as it was (tiled lighting's class plane, tested
+/// depth-equal: about 0.84 uses a frame in run-231).
+pub(crate) fn plane_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_some_and(|v| v == "1"))
+}
+
+/// (Fox T) Depth planes used before their pass, and those given their twin
+/// at once (`VICTORY_PLANE_NOW`).
+pub(crate) static PLANE_LATE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -3928,6 +4020,8 @@ pub(crate) mod spans;
 pub(crate) mod passtimes;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod walk;
+#[cfg(feature = "diagnostics")]
+mod shape;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -4336,6 +4430,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                plane_late: Mutex::default(),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -5906,6 +6001,10 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        #[cfg(feature = "diagnostics")]
+        if shape::on() {
+            shape::measure(runs);
+        }
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -6797,8 +6896,13 @@ impl HostList {
         // the plane as it was; the pass runs when the list closes
         // (`twins_to_depth`). Counted.
         if copy && !colour && twin.plane.is_some() {
-            u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+            self.plane_late.lock().unwrap_or_else(|e| e.into_inner()).push((depth.clone(), twin.clone()));
+            // (Fox T, `VICTORY_PLANE_NOW`) The pass is recorded before the
+            // draw that uses the plane (`crate::draw`), not when the list closes.
+            if !plane_now() {
+                u.late = true;
+            }
         }
         drop(twins);
         if copy {
@@ -6811,6 +6915,23 @@ impl HostList {
             self.settle(plane, UNORDERED_ACCESS);
         }
         true
+    }
+
+    /// (Fox T) The depth planes used before their pass since the last call.
+    pub(crate) fn take_plane_late(&self) -> Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)> {
+        let mut late = self.plane_late.lock().unwrap_or_else(|e| e.into_inner());
+        if late.is_empty() { Vec::new() } else { std::mem::take(&mut *late) }
+    }
+
+    /// (Fox T, `VICTORY_PLANE_NOW=1`) Records now the pass that draws each
+    /// plane's twin into the plane (`pass_plane`), which before ran when the
+    /// list closed: the caller sets the title's state on the list again
+    /// (`crate::draw::State::replay`) and binds anew before its draw.
+    pub(crate) fn planes_now(&self, late: &[(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)]) {
+        for (depth, twin) in late {
+            self.pass_plane(depth, twin);
+        }
+        self.changed_something();
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -7221,11 +7342,14 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
+        let new = deferred.refreshed.insert(key);
+        if new {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+        #[cfg(feature = "diagnostics")]
+        refresh_asked(new, len);
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -7999,6 +8123,125 @@ struct Batch {
     /// submission by its flushes, and the range, until a step of ours writes
     /// title memory there.
     once: ByCopy<(usize, usize)>,
+    /// (Coder W, `VICTORY_NARROW_WRITES=verify`) Title bytes of refreshes the narrow path would
+    /// have left pending over a write of ours: (address, bytes before it), compared at the next
+    /// step of the batch.
+    narrow_checks: Vec<(usize, Vec<u8>)>,
+    /// (Coder W, `VICTORY_REFRESH_PAGES`) Beside each of `refreshes`, the ranges its steps named
+    /// since the last flush (the entry's range is their hull). Empty with the switch off.
+    runs: Vec<Vec<(usize, usize)>>,
+    /// (Coder W, `VICTORY_REFRESH_PAGES`) What [`Batch::refresh_front`] brought up to date of
+    /// each copy (by address): the ranges themselves, in place of `ahead`'s hull.
+    ahead_runs: ByCopy<Vec<(usize, usize)>>,
+}
+
+/// (Coder W) `VICTORY_REFRESH_PAGES`: 0 off, 1 on, 2 verify.
+///
+/// A copy's refreshes of a submission were kept as one range, from the lowest address any step
+/// named to the highest ([`Batch::add`]): the title's graphics heap gets thousands of disjoint
+/// root-view refreshes a frame ("the rest of the buffer" from each view's start), and their hull
+/// is most of the heap at each of ~45 flushes (run-222: 10,396 steps, 11 GB asked a frame for
+/// 2.3 GB of distinct pages). With the switch each entry also keeps the ranges themselves, and a
+/// flush refreshes their union: the same bytes every step asked for, none of the bytes no step
+/// named. `verify`: the union is refreshed, then the hull as before (today's result stands), and
+/// what the hull's refresh still took is counted: bytes no step of the submission had named
+/// since the last flush that changed (expected where the title writes between views; a reader of
+/// them would have to be a step that did not name them).
+fn refresh_pages() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_PAGES").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// [`refresh_pages`]'s counters since the last line: hull bytes, union bytes, bytes the union's
+/// refreshes took, bytes the hull's refresh took after them (verify), entries, runs.
+static PAGES_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// (Coder W, `VICTORY_REFRESH_PAGES`) Its line, every 5 s.
+fn pages_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static DUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let due = DUE.load(Relaxed);
+    if ms >= due && DUE.compare_exchange(due, ms + 5000, Relaxed, Relaxed).is_ok() {
+        let frame = crate::frame::current();
+        let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed)).max(1) as f64;
+        let v: [u64; 6] = std::array::from_fn(|k| PAGES_STATS[k].swap(0, Relaxed));
+        let mb = |b: u64| b as f64 / 1e6 / frames;
+        tracing::info!(
+            "refreshes by the steps' ranges (VICTORY_REFRESH_PAGES={}) per frame: {:.0} copies in {:.0} ranges; asked: hull {:.1} MB, union {:.1} MB; taken by the union {:.2} MB; {}",
+            ["0", "1", "verify"][refresh_pages() as usize],
+            v[4] as f64 / frames,
+            v[5] as f64 / frames,
+            mb(v[0]),
+            mb(v[1]),
+            mb(v[2]),
+            if refresh_pages() == 2 {
+                format!("the hull took after it {:.3} MB (bytes no step named that changed)", mb(v[3]))
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+/// Ranges in order, those that overlap or touch as one.
+fn union_of(mut runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    runs.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (a, b) in runs {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// (Coder W) `VICTORY_NARROW_WRITES`: 0 off, 1 on, 2 verify.
+///
+/// A write of ours into title memory (a title copy step, a copy at its place) flushed every
+/// pending refresh of the submission and dropped every copy brought up to date ahead
+/// ([`Batch::title_written_at`]), though only those over the written bytes, or over another
+/// address that shows the same pages (`inplace::shown_elsewhere`), read anything it changes.
+/// With `1` only those are flushed and dropped; the others stay pending (done at the next
+/// flush, reading bytes this write did not change) and ahead. `verify`: done as before, and
+/// for up to 16 of the refreshes that would have stayed pending (64 KiB or less) the title's
+/// bytes are kept before the write and compared after it: bytes that differ are counted (must
+/// be 0; the title's own threads writing meanwhile would count too).
+fn narrow_writes() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_NARROW_WRITES").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// [`narrow_writes`]'s counters since the start: writes looked at, refreshes left pending,
+/// copies kept ahead, refreshes compared, bytes that differed.
+static NARROW: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The title addresses `[at, at + len)` changes: itself and every other view of its pages.
+fn written_views(at: usize, len: usize) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 1 << 16;
+    let end = at + len;
+    let mut out = vec![(at, end)];
+    for (block, others) in crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, end) {
+        let (from, to) = (at.max(block), end.min(block + BLOCK));
+        if from >= to {
+            continue;
+        }
+        for other in others {
+            out.push((other + (from - block), other + (to - block)));
+        }
+    }
+    out
 }
 
 /// (Coder W) `VICTORY_ASK_KEPT_EARLY=1` ([`Batch::flush_all`]).
@@ -8167,6 +8410,58 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
     spans
 }
 
+/// (Coder W, `VICTORY_REFRESH_PAGES`) [`front_spans`] with each copy's ranges kept, not their
+/// hull: (copy, from, to) for every range of the union of what its steps named, in order, and
+/// per copy its hull (copy, from, to).
+fn front_runs(steps: impl Iterator<Item = Touch>) -> (Vec<(usize, usize, usize)>, Vec<(usize, usize, usize)>) {
+    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut copies: Vec<usize> = Vec::new();
+    let mut ranges: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut given: Vec<u32> = Vec::new();
+    let (mut part, mut last) = (1, usize::MAX);
+    for step in steps {
+        match step {
+            Touch::Refresh(copy, from, to) => {
+                let i = if copies.get(last).is_some_and(|&c| c == copy) {
+                    last
+                } else {
+                    *at.entry(copy).or_insert_with(|| {
+                        copies.push(copy);
+                        ranges.push(Vec::new());
+                        given.push(0);
+                        copies.len() - 1
+                    })
+                };
+                last = i;
+                if given[i] != part && from < to && ranges[i].last() != Some(&(from, to)) {
+                    ranges[i].push((from, to));
+                }
+            }
+            Touch::Write(copy) => {
+                let i = *at.entry(copy).or_insert_with(|| {
+                    copies.push(copy);
+                    ranges.push(Vec::new());
+                    given.push(0);
+                    copies.len() - 1
+                });
+                given[i] = part;
+            }
+            Touch::Part => part += 1,
+            Touch::Title | Touch::Nothing => {}
+        }
+    }
+    let (mut runs, mut hulls) = (Vec::new(), Vec::new());
+    for (copy, r) in copies.into_iter().zip(ranges) {
+        if r.is_empty() {
+            continue;
+        }
+        let hull = (r.iter().map(|x| x.0).min().unwrap_or(0), r.iter().map(|x| x.1).max().unwrap_or(0));
+        hulls.push((copy, hull.0, hull.1));
+        runs.extend(union_of(r).into_iter().map(|(a, b)| (copy, a, b)));
+    }
+    (runs, hulls)
+}
+
 /// What a step is to the copies' refreshes, for [`written_spans`].
 enum Touch {
     /// A refresh of a copy (by address), from, to.
@@ -8314,6 +8609,10 @@ impl Batch {
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
+        // (`VICTORY_REFRESH_PAGES`) Inside one range refreshed in front.
+        if self.ahead_runs.get(&key).is_some_and(|runs| runs.iter().any(|&(from, to)| from <= address && end <= to)) {
+            return;
+        }
         // (`VICTORY_REFRESH_ONCE`) Brought up to date by a flush of this
         // submission, and no step of ours wrote title memory there since.
         if refresh_once() != Once::Off && self.once.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
@@ -8331,14 +8630,25 @@ impl Batch {
             once_verify(shadow, address, len);
             return;
         }
+        let pages = refresh_pages() != 0;
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                if pages {
+                    let runs = &mut self.runs[at];
+                    // (The same range again, as most repeats are, is not kept twice.)
+                    if runs.last() != Some(&(address, end)) {
+                        runs.push((address, end));
+                    }
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
                 self.refreshes.push((shadow.clone(), address, end));
+                if pages {
+                    self.runs.push(vec![(address, end)]);
+                }
             }
         }
     }
@@ -8350,11 +8660,13 @@ impl Batch {
         // is in front of all the steps was, up to here.)
         if !self.front {
             self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead_runs.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let runs = if refresh_pages() != 0 { union_of(self.runs.swap_remove(at)) } else { Vec::new() };
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
@@ -8363,7 +8675,10 @@ impl Batch {
         let started = std::time::Instant::now();
         // (Coder W) Timed by what the refresh came to (`crate::copystep::flushed`).
         let timed = std::time::Instant::now();
-        let kind = if crate::watch::light() && shadow.nothing_new(from, to - from) {
+        let kind = if !runs.is_empty() {
+            Self::update_runs(&shadow, &runs, (from, to));
+            2
+        } else if crate::watch::light() && shadow.nothing_new(from, to - from) {
             0
         } else if crate::chunks::known(shadow.id(), from, to) {
             1
@@ -8382,7 +8697,7 @@ impl Batch {
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         // (`VICTORY_CHUNK_FINAL`) Final chunks under it, as they are now.
@@ -8394,6 +8709,7 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         preparing(0, us);
         preparing(1, copied as u64);
+        copied
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -8418,9 +8734,19 @@ impl Batch {
     /// submission that holds some of those bytes, the larger part beside them
     /// stays so (fox: every copy is asked again after every title copy).
     fn title_written_at(&mut self, at: usize, len: usize) {
-        self.flush();
-        // Fox's skip goes whole, as before.
-        self.ahead.clear();
+        self.narrow_verify();
+        match narrow_writes() {
+            1 => self.written_narrow(at, len),
+            mode => {
+                if mode == 2 {
+                    self.narrow_keep(at, len);
+                }
+                self.flush();
+                // Fox's skip goes whole, as before.
+                self.ahead.clear();
+                self.ahead_runs.clear();
+            }
+        }
         if refresh_once() != Once::Off {
             let end = at + len;
             self.once.retain(|_, entry| {
@@ -8439,6 +8765,82 @@ impl Batch {
         }
         self.textures.clear();
         crate::chunks::wrote(at, len);
+    }
+
+    /// (Coder W, `VICTORY_NARROW_WRITES=1`) [`Batch::title_written_at`]'s flush and drop, for
+    /// what lies over the written bytes or another view of them only.
+    fn written_narrow(&mut self, at: usize, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hit = written_views(at, len);
+        let meets = |from: usize, to: usize| hit.iter().any(|&(a, b)| from < b && a < to);
+        NARROW[0].fetch_add(1, Relaxed);
+        self.refresh_textures();
+        let over: Vec<std::sync::Arc<crate::shadow::Shadow>> =
+            self.refreshes.iter().filter(|r| meets(r.1, r.2)).map(|r| r.0.clone()).collect();
+        NARROW[1].fetch_add((self.refreshes.len() - over.len()) as u64, Relaxed);
+        for shadow in over {
+            self.flush_one(&shadow);
+        }
+        let before = self.ahead.len();
+        self.ahead.retain(|_, r| !meets(r.0, r.1));
+        self.ahead_runs.clear();
+        NARROW[2].fetch_add(self.ahead.len() as u64, Relaxed);
+        let _ = before;
+        if NARROW[0].load(Relaxed) % 4096 == 1 {
+            tracing::info!(
+                "narrow writes (VICTORY_NARROW_WRITES=1), since the start: {} writes, {} refreshes left pending, {} copies kept ahead",
+                NARROW[0].load(Relaxed),
+                NARROW[1].load(Relaxed),
+                NARROW[2].load(Relaxed)
+            );
+        }
+    }
+
+    /// (`VICTORY_NARROW_WRITES=verify`) Before a write of ours: the bytes of refreshes the
+    /// narrow path would leave pending.
+    fn narrow_keep(&mut self, at: usize, len: usize) {
+        let hit = written_views(at, len);
+        let meets = |from: usize, to: usize| hit.iter().any(|&(a, b)| from < b && a < to);
+        NARROW[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for r in self.refreshes.iter().filter(|r| !meets(r.1, r.2) && r.2 - r.1 <= 64 << 10).take(16) {
+            let mut bytes = vec![0u8; r.2 - r.1];
+            if read_into(r.1 as *const u8, &mut bytes) {
+                self.narrow_checks.push((r.1, bytes));
+            }
+        }
+    }
+
+    /// (`VICTORY_NARROW_WRITES=verify`) After the write: what was kept, compared.
+    fn narrow_verify(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.narrow_checks.is_empty() {
+            return;
+        }
+        for (at, was) in std::mem::take(&mut self.narrow_checks) {
+            let mut now = vec![0u8; was.len()];
+            if !read_into(at as *const u8, &mut now) {
+                continue;
+            }
+            NARROW[3].fetch_add(1, Relaxed);
+            let differ = now.iter().zip(&was).filter(|(a, b)| a != b).count() as u64;
+            if differ > 0 {
+                let n = NARROW[4].fetch_add(differ, Relaxed);
+                if n < 4096 {
+                    tracing::warn!(at = format_args!("{at:#x}"), differ, "narrow writes (verify): a refresh left pending would have read changed bytes");
+                }
+            }
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, Relaxed) % 2048 == 0 {
+            tracing::info!(
+                "narrow writes (VICTORY_NARROW_WRITES), since the start: {} writes, {} refreshes left pending, {} copies kept ahead, {} compared; MUST BE 0: bytes that differ {}",
+                NARROW[0].load(Relaxed),
+                NARROW[1].load(Relaxed),
+                NARROW[2].load(Relaxed),
+                NARROW[3].load(Relaxed),
+                NARROW[4].load(Relaxed)
+            );
+        }
     }
 
     /// (`VICTORY_REFRESH_ONCE=1`) `[from, to)` of the copy `key` is up to date
@@ -8487,13 +8889,36 @@ impl Batch {
                 }
             }
         }
-        let spans: Vec<_> = front_spans(touches.into_iter())
-            .into_iter()
-            .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
-            .collect();
+        // (Coder W, `VICTORY_REFRESH_PAGES`) Each range of the union of what the steps named, not
+        // the hull: what is in front is what they asked for, and `ahead_runs` says so to `add`.
+        let pages = refresh_pages();
+        let mut hulls: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let spans: Vec<_> = if pages != 0 {
+            let (runs, hull) = front_runs(touches.into_iter());
+            hulls = hull.into_iter().filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to))).collect();
+            runs.into_iter().filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to))).collect()
+        } else {
+            front_spans(touches.into_iter())
+                .into_iter()
+                .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
+                .collect()
+        };
         self.front = true;
-        for (shadow, from, to) in &spans {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+        if pages != 0 {
+            for (shadow, from, to) in &spans {
+                self.ahead_runs.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*from, *to));
+            }
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                PAGES_STATS[0].fetch_add(hulls.iter().map(|h| (h.2 - h.1) as u64).sum(), Relaxed);
+                PAGES_STATS[1].fetch_add(spans.iter().map(|r| (r.2 - r.1) as u64).sum(), Relaxed);
+                PAGES_STATS[4].fetch_add(hulls.len() as u64, Relaxed);
+                PAGES_STATS[5].fetch_add(spans.len() as u64, Relaxed);
+            }
+        } else {
+            for (shadow, from, to) in &spans {
+                self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            }
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -8538,8 +8963,22 @@ impl Batch {
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            Self::update(shadow, *from, *to);
+            let took = Self::update(shadow, *from, *to);
+            if pages != 0 {
+                PAGES_STATS[2].fetch_add(took as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         });
+        if pages == 2 {
+            // (verify) The hull, as without the switch: what it still takes no step named.
+            crate::shadow::wide_each(hulls.len(), move |i| {
+                let (shadow, from, to) = &hulls[i];
+                let extra = shadow.update(*from, *to - *from);
+                PAGES_STATS[3].fetch_add(extra as u64, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        if pages != 0 {
+            pages_line();
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8664,12 +9103,76 @@ impl Batch {
         }
     }
 
+    /// (`VICTORY_REFRESH_PAGES`) A copy's refresh at a flush: each range of the union that is not
+    /// known clean or known by final chunks, brought up to date; with `verify` then the hull, as
+    /// before, counting what it still took.
+    fn update_runs(shadow: &std::sync::Arc<crate::shadow::Shadow>, runs: &[(usize, usize)], hull: (usize, usize)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let light = crate::watch::light();
+        let mut took = 0u64;
+        for &(a, b) in runs {
+            if light && shadow.nothing_new(a, b - a) || crate::chunks::known(shadow.id(), a, b) {
+                continue;
+            }
+            took += Self::update(shadow, a, b) as u64;
+        }
+        PAGES_STATS[0].fetch_add((hull.1 - hull.0) as u64, Relaxed);
+        PAGES_STATS[1].fetch_add(runs.iter().map(|r| (r.1 - r.0) as u64).sum(), Relaxed);
+        PAGES_STATS[2].fetch_add(took, Relaxed);
+        PAGES_STATS[4].fetch_add(1, Relaxed);
+        PAGES_STATS[5].fetch_add(runs.len() as u64, Relaxed);
+        if refresh_pages() == 2 {
+            let extra = shadow.update(hull.0, hull.1 - hull.0);
+            PAGES_STATS[3].fetch_add(extra as u64, Relaxed);
+        }
+    }
+
+    /// (`VICTORY_REFRESH_PAGES`) [`Batch::flush_all`] over the steps' ranges.
+    fn flush_all_pages(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let spans = std::mem::take(&mut self.refreshes);
+        let runs = std::mem::take(&mut self.runs);
+        let work: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>, (usize, usize))> =
+            spans.into_iter().zip(runs).map(|((s, f, t), r)| (s, union_of(r), (f, t))).collect();
+        if refresh_once() != Once::Off {
+            let notes: Vec<(usize, usize, usize)> = work
+                .iter()
+                .flat_map(|(s, r, _)| r.iter().map(move |&(a, b)| (std::sync::Arc::as_ptr(s) as usize, a, b)))
+                .collect();
+            for (key, a, b) in notes {
+                self.brought(key, a, b);
+            }
+        }
+        if work.len() > 1 && !(ask_kept_early() && crate::watch::once_kept()) {
+            let ranges: Vec<(usize, usize)> = work.iter().filter(|w| w.0.asked_ahead()).flat_map(|w| w.1.iter().copied()).collect();
+            crate::watch::ask_ahead(&ranges);
+            crate::watch::ask_ahead_done();
+        }
+        if wide_refresh() && work.len() >= 4 {
+            crate::shadow::wide_each(work.len(), move |i| {
+                let (shadow, runs, hull) = &work[i];
+                Self::update_runs(shadow, runs, *hull);
+            });
+        } else {
+            for (shadow, runs, hull) in &work {
+                Self::update_runs(shadow, runs, *hull);
+            }
+        }
+        pages_line();
+    }
+
     fn flush_all(&mut self) {
+        if refresh_pages() != 0 {
+            return self.flush_all_pages();
+        }
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
+        // (Coder W, diagnostics) Where a flush's time goes (`crate::copystep::FlushSplit`).
+        #[cfg(feature = "diagnostics")]
+        let mut split = crate::copystep::FlushSplit::begin(self.refreshes.len());
         // (`VICTORY_REFRESH_ONCE=1`) What this flush brings up to date is not
         // asked again in the submission until a step writes title memory
         // there (noted now: the flush is done before the next step).
@@ -8682,9 +9185,13 @@ impl Batch {
         }
         // (`VICTORY_CHUNK_FINAL`) What lies in chunks a copy took since they
         // were last retired is as it was: not asked about, not compared.
+        #[cfg(feature = "diagnostics")]
+        split.part(0);
         if crate::chunks::final_on() {
             self.refreshes.retain(|(shadow, from, to)| !crate::chunks::known(shadow.id(), *from, *to));
         }
+        #[cfg(feature = "diagnostics")]
+        split.part(1);
         let light = crate::watch::light();
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
@@ -8695,6 +9202,8 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        split.part(2);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         // (Coder W, `VICTORY_ASK_KEPT_EARLY=1`, default off) With the submission's one asking
@@ -8721,6 +9230,10 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        split.part(3);
+        #[cfg(feature = "diagnostics")]
+        split.left(self.refreshes.len());
         if wide_refresh() && self.refreshes.len() >= if prepare_wide() { 2 } else { 4 } {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -8745,20 +9258,49 @@ impl Batch {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
                     .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|(shadow, from, to)| Box::new(move || { Self::update(&shadow, from, to); }) as Box<dyn FnOnce() + Send>)
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             preparing_sub(0, summed.saturating_sub(started.elapsed().as_micros() as u64));
+            // (Coder W, diagnostics) How long the submitting thread stood here for the workers,
+            // against their summed time: what overlapping it with other work could win.
+            #[cfg(feature = "diagnostics")]
+            {
+                static WIDE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+                WIDE[0].fetch_add(1, Ordering::Relaxed);
+                WIDE[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                WIDE[2].fetch_add(summed, Ordering::Relaxed);
+                static LAST: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                let (at, f) = *last.get_or_insert((std::time::Instant::now(), crate::frame::current()));
+                if at.elapsed().as_secs() >= 5 {
+                    let frames = crate::frame::current().saturating_sub(f).max(1) as f64;
+                    *last = Some((std::time::Instant::now(), crate::frame::current()));
+                    let v: [u64; 3] = std::array::from_fn(|i| WIDE[i].swap(0, Ordering::Relaxed));
+                    tracing::info!(
+                        "wide refreshes per frame: {:.1} flushes, the submitting thread waited {:.2} ms for workers that ran {:.2} ms in all",
+                        v[0] as f64 / frames,
+                        v[1] as f64 / 1e3 / frames,
+                        v[2] as f64 / 1e3 / frames
+                    );
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            split.part(4);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
             }
+            #[cfg(feature = "diagnostics")]
+            split.part(5);
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        #[cfg(feature = "diagnostics")]
+        split.part(6);
     }
 }
 
@@ -9313,11 +9855,26 @@ impl Meter {
         spans::line(frames);
         #[cfg(feature = "diagnostics")]
         passtimes::line(frames);
+        crate::stalecheck::line(frames);
         #[cfg(feature = "diagnostics")]
         card_split_line(frames);
+        #[cfg(feature = "diagnostics")]
+        refresh_kinds_line(frames);
+        #[cfg(feature = "diagnostics")]
+        shape::line(frames);
         crate::draw::bind_same_line(frames);
         crate::draw::table_memo_line(frames);
         crate::draw::list_alias_line(frames);
+        {
+            let [late, now] = [0, 1].map(|i| PLANE_LATE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if late > 0.0 {
+                tracing::info!(
+                    "depth planes used before the pass that gives them their twin per frame: {late:.2}, given it before that use (VICTORY_PLANE_NOW=1) {now:.2}"
+                );
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::nanmeter::line(frames);
         #[cfg(feature = "diagnostics")]
         walk::line(frames);
         crate::shadow::back_line(frames);

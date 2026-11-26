@@ -86,6 +86,11 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+// (Fox T) VICTORY_REFRESH_STALE=verify: the stale-page refresh's verify harness (W's hook calls it)
+mod stalecheck;
+// (Fox T) VICTORY_NAN_METER=1: NaNs and infinities counted per program where they are stored
+#[cfg(feature = "diagnostics")]
+mod nanmeter;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

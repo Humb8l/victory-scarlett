@@ -2948,9 +2948,18 @@ impl HostHeap {
                     if let Some(written) = self.written.get(index as usize) {
                         written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
                     }
-                    batch.copies.push((self.cpu(index), slot0));
+                    if batch.now {
+                        self.copy_from(index, slot0);
+                        if made.twin && twins {
+                            self.copy_from(self.raw + index, slot1);
+                        }
+                    } else {
+                        batch.copies.push((self.cpu(index), slot0));
+                        if made.twin && twins {
+                            batch.copies.push((self.cpu(self.raw + index), slot1));
+                        }
+                    }
                     if made.twin && twins {
-                        batch.copies.push((self.cpu(self.raw + index), slot1));
                         self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         self.clear_twin(index);
@@ -6003,6 +6012,18 @@ struct ListView {
 pub(crate) struct CopyBatch {
     copies: Vec<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)>,
     pub(crate) keep: Vec<ID3D12Resource>,
+    /// (Fox T, `VICTORY_LIST_HOLD=1`) The copies done at once, one by one,
+    /// as without a batch: only the holds go to the list.
+    pub(crate) now: bool,
+}
+
+/// `VICTORY_LIST_HOLD=1` (default off): the half of [`list_batch`] that holds
+/// a view's resource once per list (`HostList::keep`) instead of in every slot
+/// (a Mutex, an AddRef and a Release per slot); the descriptors are copied one
+/// by one as before.
+pub(crate) fn list_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_HOLD").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_LIST_BATCH=1`.

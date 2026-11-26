@@ -58,7 +58,33 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        // (Coder W) A stamp of a range over it is no more ([`BlockSeqs`]).
+        bump_block(page);
+        // (Coder W, `VICTORY_REFRESH_STALE`) Into the log the copies read their changes from.
+        stalelog::append(page, now);
         let before = self.written.insert(page, now).unwrap_or(0);
+        // (Coder W, diagnostics) The journal's size over the session, every 30 s.
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            static NOTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30);
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let n = NOTES.fetch_add(1, Relaxed);
+            if n % 4096 == 0 {
+                let s = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+                if s >= NEXT.load(Relaxed) {
+                    NEXT.store(s + 30, Relaxed);
+                    tracing::info!(
+                        seconds = s,
+                        pages = self.written.len(),
+                        pages_with_parts = self.parts.len(),
+                        notes = n,
+                        "the write journal: pages it holds (one stamp each, the last write) and pages with parts"
+                    );
+                }
+            }
+        }
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -223,24 +249,166 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
         Ok(j) => j,
         Err(_) => waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner())),
     };
-    // (Coder W) Whatever is changed under it, a stamp taken before is no more.
-    bump_write_gen();
     j
 }
 
-/// (Coder W, `VICTORY_CLEAN_STAMP`) Counts every change of what [`nothing_new`] reads: the
-/// journal (each time it is held to change it), a block's published bit cleared, a block
-/// marked written beside its guard. An answer of [`nothing_new`] found with the count at
-/// `g` still holds while the count is `g` (it only reads those, and the copy's own notes,
-/// which only grow more current).
-static WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// (Coder W, `VICTORY_CLEAN_STAMP`) Per 64 KiB block, the number of the last change of what
+/// [`nothing_new`] reads of it when its blocks are known by their bits: a journal note of the
+/// block, its published bit cleared, a write beside its guard. Numbers come from one counter,
+/// so "no block of a range changed since number `n`" is a walk over the range's blocks with
+/// no lock. A range found clean by its bits with the counter at `n` (read before the look) is
+/// clean while every block's number is still at most `n` (the copy's own notes only grow more
+/// current; shaders' ranges in flight clear the copy's stamp).
+struct BlockSeqs([std::sync::atomic::AtomicPtr<[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]>; BlockSeqs::PIECES]);
 
-pub(crate) fn write_gen() -> u64 {
-    WRITE_GEN.load(std::sync::atomic::Ordering::SeqCst)
+impl BlockSeqs {
+    /// Blocks of a piece (1 GiB).
+    const IN_PIECE: usize = 1 << 14;
+    /// 128 TiB.
+    const PIECES: usize = 1 << 17;
+
+    fn piece(&self, block: usize) -> Option<&[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]> {
+        let p = self.0.get(block / Self::IN_PIECE)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `bump`, never freed.
+        unsafe { p.as_ref() }
+    }
 }
 
-fn bump_write_gen() {
-    WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+static BLOCK_SEQS: BlockSeqs = BlockSeqs([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; BlockSeqs::PIECES]);
+static BLOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The number a look about to begin is stamped with.
+pub(crate) fn block_seq_now() -> u64 {
+    BLOCK_SEQ.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Block `block` changed (see [`BlockSeqs`]).
+fn bump_block(block: usize) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+    let Some(place) = BLOCK_SEQS.0.get(block / BlockSeqs::IN_PIECE) else {
+        return;
+    };
+    if place.load(Acquire).is_null() {
+        let piece: Box<[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]> =
+            Box::new([const { std::sync::atomic::AtomicU64::new(0) }; BlockSeqs::IN_PIECE]);
+        let piece = Box::into_raw(piece);
+        if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+            // SAFETY: made just now, and another thread's is there.
+            drop(unsafe { Box::from_raw(piece) });
+        }
+    }
+    let n = BLOCK_SEQ.fetch_add(1, SeqCst) + 1;
+    if let Some(piece) = BLOCK_SEQS.piece(block) {
+        piece[block % BlockSeqs::IN_PIECE].fetch_max(n, SeqCst);
+    }
+}
+
+/// (Coder W) `VICTORY_REFRESH_STALE`: every journal note, in order, per region of 1 GiB of
+/// title address space (64 KiB pages; the same page noted twice on end is kept once). A copy
+/// reads what was added over its span since it last read ([`stalelog::pull`]) and marks those
+/// pages stale: what the journal has noted since, whatever noted it (askings, guards, our writes,
+/// landings, other views noted by their callers). A region keeps its last `KEEP` notes; a copy
+/// that read before what was dropped marks its whole span in that region stale (as at its
+/// first read).
+pub(crate) mod stalelog {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::RwLock;
+
+    /// Pages of a region (1 GiB).
+    pub(crate) const REGION: usize = 1 << 14;
+    const KEEP: usize = 1 << 17;
+
+    /// 0 off, 1 on, 2 verify.
+    pub(crate) fn mode() -> u8 {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_STALE").as_deref().map(str::trim) {
+            Ok("1") => 1,
+            Ok("verify") => 2,
+            _ => 0,
+        })
+    }
+
+    struct Region {
+        /// The number of `pages[0]`.
+        first: u64,
+        /// The page (in the region) and the asking that noted it (the latest, for a repeat).
+        pages: VecDeque<(u32, u64)>,
+    }
+
+    static LOG: RwLock<Option<HashMap<usize, Region>>> = RwLock::new(None);
+
+    /// Page `page` was noted (under the journal's lock).
+    pub(super) fn append(page: usize, asking: u64) {
+        if mode() == 0 {
+            return;
+        }
+        let (region, at) = (page / REGION, (page % REGION) as u32);
+        let mut log = LOG.write().unwrap_or_else(|e| e.into_inner());
+        let r = log.get_or_insert_with(HashMap::new).entry(region).or_insert(Region { first: 0, pages: VecDeque::new() });
+        if let Some(last) = r.pages.back_mut()
+            && last.0 == at
+        {
+            last.1 = last.1.max(asking);
+            return;
+        }
+        if r.pages.len() >= KEEP {
+            r.pages.pop_front();
+            r.first += 1;
+        }
+        r.pages.push_back((at, asking));
+    }
+
+    /// Of the pages `[first, last)`: marks in `stale` (a bit per page from `first`) every page
+    /// noted since `pos` (per region, the number to read from; updated), all of a region's
+    /// pages if what it had read is gone.
+    /// Returns the pages it marked whose note came after asking `now` (the caller's answer has
+    /// not seen them: they stay stale after it takes the range).
+    pub(crate) fn pull(first: usize, last: usize, pos: &mut HashMap<usize, u64>, stale: &mut [u64], now: u64) -> Vec<usize> {
+        let mut later = Vec::new();
+        let log = LOG.read().unwrap_or_else(|e| e.into_inner());
+        let Some(log) = log.as_ref() else {
+            return later;
+        };
+        let mut mark = |page: usize| {
+            let i = page - first;
+            stale[i / 64] |= 1 << (i % 64);
+        };
+        for region in first / REGION..=(last.max(first + 1) - 1) / REGION {
+            let Some(r) = log.get(&region) else {
+                continue;
+            };
+            let end = r.first + r.pages.len() as u64;
+            let from = pos.get(&region).copied();
+            let (lo, hi) = ((region * REGION).max(first), ((region + 1) * REGION).min(last));
+            match from {
+                Some(p) if p >= r.first => {
+                    for &(at, asking) in r.pages.range((p - r.first) as usize..) {
+                        let page = region * REGION + at as usize;
+                        if (lo..hi).contains(&page) {
+                            mark(page);
+                            if asking > now {
+                                later.push(page);
+                            }
+                        }
+                    }
+                }
+                _ => (lo..hi).for_each(&mut mark),
+            }
+            pos.insert(region, end);
+        }
+        later
+    }
+}
+
+/// Whether no block of `[start, end)` changed after number `n` ([`BlockSeqs`]).
+pub(crate) fn blocks_unchanged_since(start: usize, end: usize, n: u64) -> bool {
+    (start / BLOCK..end.div_ceil(BLOCK))
+        .all(|b| BLOCK_SEQS.piece(b).is_none_or(|p| p[b % BlockSeqs::IN_PIECE].load(std::sync::atomic::Ordering::SeqCst) <= n))
+}
+
+/// Whether every block of `[start, end)` is known clean by its bits ([`published`]).
+pub(crate) fn known_by_bits(start: usize, end: usize) -> bool {
+    published(start, end)
 }
 
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
@@ -1001,7 +1169,7 @@ impl Bits {
         }
         // (Coder W) Written beside its guard: no longer known clean.
         if std::ptr::eq(self, &BESIDE) {
-            bump_write_gen();
+            bump_block(block);
         }
     }
 
@@ -1028,7 +1196,7 @@ impl Bits {
         }
         // (Coder W) Not known by its bit any more.
         if std::ptr::eq(self, &PUBLISHED) {
-            bump_write_gen();
+            bump_block(block);
         }
     }
 

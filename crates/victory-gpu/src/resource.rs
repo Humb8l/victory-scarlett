@@ -1892,9 +1892,12 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
 /// title bytes, the copy's serial, host bytes.
 #[cfg(windows)]
 pub(crate) fn placed_copies() -> Vec<(u64, u64, u64, u64)> {
-    let all: Vec<usize> = textures().iter().copied().collect();
+    // (V) Under the table's lock, as `census`: a copy of its addresses let
+    // go of the lock and read textures freed meanwhile (run-232: an access
+    // violation at 0xbc in this function, on the page-kinds thread).
+    let all = textures();
     let mut out = Vec::new();
-    for at in all {
+    for &at in all.iter() {
         // SAFETY: as in `census`: the table holds live resources.
         let r = unsafe { &*(at as *const Resource) };
         if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {

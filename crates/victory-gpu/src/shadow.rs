@@ -54,8 +54,11 @@ pub(crate) struct Shadow {
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
     /// (Coder W, `VICTORY_CLEAN_STAMP`) The last range [`Shadow::nothing_new`] found clean,
-    /// with `crate::watch::write_gen` read before it looked: (count, from, to); count 0 = none.
+    /// with `crate::watch::block_seq_now` read before it looked: (number, from, to); 0 = none.
     clean: Mutex<(u64, usize, usize)>,
+    /// (Coder W, `VICTORY_REFRESH_STALE`) The copy's stale pages (a bit per 64 KiB page from the
+    /// copy's first) and where it read the note log to, per region; `None` before its first use.
+    stale: Mutex<Option<(Vec<u64>, std::collections::HashMap<usize, u64>)>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3306,6 +3309,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             clean: Mutex::new((0, 0, 0)),
+            stale: Mutex::new(None),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -4096,10 +4100,10 @@ impl Shadow {
         // (Coder W, `VICTORY_CLEAN_STAMP=1|verify`) Found clean before, and nothing it rests
         // on changed since: clean, with no other lock, no walk.
         let stamp = crate::copystep::clean_stamp();
-        let generation = crate::watch::write_gen();
+        let generation = crate::watch::block_seq_now();
         let stamped = stamp != 0 && {
             let c = *self.clean.lock().unwrap_or_else(|e| e.into_inner());
-            c.0 == generation && c.1 <= from && to <= c.2
+            c.0 != 0 && c.1 <= from && to <= c.2 && crate::watch::blocks_unchanged_since(from, to, c.0)
         };
         if stamped && stamp == 1 {
             crate::copystep::stamp_count(crate::copystep::S_HIT, 1);
@@ -4115,10 +4119,12 @@ impl Shadow {
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         drop(copied);
         crate::copystep::stamp_looked(stamped, same, looked);
-        if same && stamp != 0 {
+        // (Only an answer the blocks' bits gave: one the submission's asking gave can change
+        // with the asking, which no block number follows.)
+        if same && stamp != 0 && crate::watch::known_by_bits(from, to) {
             let mut c = self.clean.lock().unwrap_or_else(|e| e.into_inner());
-            // (A wider range found clean at the same count is kept.)
-            if !(c.0 == generation && c.1 <= from && to <= c.2) {
+            // (A wider range still clean is kept.)
+            if !(c.0 != 0 && c.1 <= from && to <= c.2 && crate::watch::blocks_unchanged_since(from, to, c.0)) {
                 *c = (generation, from, to);
             }
         }
@@ -4443,6 +4449,9 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let parts = crate::watch::parts_written(&again_at);
+        // (Coder W, diagnostics) Pages walked against pages taken: what a stale set could save.
+        #[cfg(feature = "diagnostics")]
+        crate::copystep::walked(last + 1 - from / PAGE, runs.iter().map(|r| (r.1 - r.0).div_ceil(PAGE)).sum::<usize>(), written.len());
         if crate::copystep::account_on() {
             let first = runs.iter().filter(|r| !r.2).map(|r| (r.1 - r.0).div_ceil(PAGE) as u64).sum();
             crate::copystep::found(&again_at, first);
@@ -4471,6 +4480,21 @@ impl Shadow {
             crate::knownwrites::verify(self.id, kind, self.start, self.len, from, to, &seen, &compare);
         }
         let runs = by_parts(runs, &again_at, &parts);
+        // (Coder W, `VICTORY_REFRESH_STALE=verify`) Today's pages against the stale set's, then
+        // the stale pages wholly in the range are current.
+        if crate::watch::stalelog::mode() == 2 {
+            // Everything noted up to now, this refresh's own asking's finds too; what came after
+            // its answer (`now`) stays stale.
+            let later = self.stale_pull(now);
+            let mut truth: Vec<usize> = Vec::new();
+            for &(a, b, _) in &runs {
+                truth.extend(a / PAGE..b.div_ceil(PAGE));
+            }
+            let stale = self.stale_pages(from, to);
+            crate::stalecheck::verify(self.id, self.start, self.len, from, to, &truth, &stale);
+            self.stale_taken(from, to);
+            self.stale_mark(&later);
+        }
         // (Coder H, F23, `VICTORY_LOCK_METER=1`) What the watch found written, classed.
         if crate::lockmeter::on() {
             let kind = crate::lockmeter::kind(self.window, self.mapped, self.card.is_some());
@@ -4684,6 +4708,65 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// (Coder W, `VICTORY_REFRESH_STALE`) Reads the note log over the copy's span into its stale
+    /// pages (all pages stale at the first read).
+    fn stale_pull(&self, now: u64) -> Vec<usize> {
+        let first = self.start as usize / PAGE;
+        let last = ((self.start + self.len) as usize).div_ceil(PAGE);
+        let mut st = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        let (bits, pos) = st.get_or_insert_with(|| (vec![u64::MAX; (last - first).div_ceil(64)], std::collections::HashMap::new()));
+        crate::watch::stalelog::pull(first, last, pos, bits, now)
+    }
+
+    /// (Coder W, `VICTORY_REFRESH_STALE`) `pages` are stale again.
+    fn stale_mark(&self, pages: &[usize]) {
+        if pages.is_empty() {
+            return;
+        }
+        let first = self.start as usize / PAGE;
+        let mut st = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((bits, _)) = st.as_mut() {
+            for &p in pages {
+                let i = p - first;
+                if let Some(w) = bits.get_mut(i / 64) {
+                    *w |= 1 << (i % 64);
+                }
+            }
+        }
+    }
+
+    /// (Coder W, `VICTORY_REFRESH_STALE`) The 64 KiB pages of `[from, to)` the stale path would
+    /// take now (marked stale since the copy last took them).
+    pub(crate) fn stale_pages(&self, from: usize, to: usize) -> Vec<usize> {
+        let first = self.start as usize / PAGE;
+        let st = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((bits, _)) = st.as_ref() else {
+            return (from / PAGE..to.div_ceil(PAGE)).collect();
+        };
+        (from / PAGE..to.div_ceil(PAGE))
+            .filter(|&p| p >= first && bits.get((p - first) / 64).is_none_or(|w| w >> ((p - first) % 64) & 1 != 0))
+            .collect()
+    }
+
+    /// (Coder W, `VICTORY_REFRESH_STALE`) `[from, to)` was brought up to date: its pages wholly in
+    /// it (and in the copy) are not stale.
+    fn stale_taken(&self, from: usize, to: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let first = start / PAGE;
+        let mut st = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((bits, _)) = st.as_mut() else {
+            return;
+        };
+        for p in from / PAGE..to.div_ceil(PAGE) {
+            if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
+                let i = p - first;
+                if let Some(w) = bits.get_mut(i / 64) {
+                    *w &= !(1 << (i % 64));
+                }
+            }
+        }
     }
 
     /// Whether shaders read and write this copy in the card's own memory

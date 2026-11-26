@@ -15,7 +15,7 @@ no game files, code or assets.**
 3. **Start the game.** Drag your game folder onto **`Play-Scarlett.cmd`**.
    After the first time, just double-click `Play-Scarlett.cmd`: it remembers the folder.
 
-That is all. `Play-Scarlett.cmd` sets every setting and memory hook this branch is measured with, in Series X mode.
+That is all. `Play-Scarlett.cmd` sets every setting this branch runs with, in Series X mode.
 
 Good to know:
 
@@ -30,7 +30,15 @@ Good to know:
   .\scripts\play-scarlett.ps1 -RayTracing
   ```
 
-- **Something looks wrong?** Try without the memory hooks: `.\scripts\play-scarlett.ps1 -NoHooks`
+- **Bushes, trees and palms glow violet?** That is the base's picture with ray tracing off. This removes it
+  (it costs some frame time, and the first start with it is slow):
+
+  ```powershell
+  .\scripts\play-scarlett.ps1 -ProbeRays
+  ```
+
+- **More speed:** `.\scripts\play-scarlett.ps1 -Hooks` turns the memory hooks on (about 10-15 ms a frame less in
+  the opening scenes). They are off by default: they can show a few small textures with old contents for a moment.
 - More options are listed at the top of `scripts\play-scarlett.ps1` (other cache or save folders, a release build,
   automatic start-screen presses, any single setting through `-More`).
 
@@ -40,7 +48,7 @@ This branch is codec-d/cool_fox at `f4b48ad` (itself avatarmanz/VIctory-7900XTX 
 work of a local fork ("Scarlett") ported onto it. Target PC: Ryzen 7 9800X3D, 32 GB RAM, RTX 4080 SUPER 16 GB,
 2560x1440, Series X mode. Goal: a stable 30 frames a second with no loss of picture. It is not there yet.
 
-## Measured (6-minute opening route, diagnostics build, ray tracing off)
+## Measured (6-minute opening route, diagnostics build, ray tracing off, with `-Hooks`)
 
 | | cool_fox as it was (floor) | this branch, current settings |
 |---|---|---|
@@ -70,14 +78,18 @@ All settings are environment variables read at start; `scripts\play-scarlett.ps1
 - `VICTORY_LEVELS_ON_DEMAND=0`: textures keep only the levels their views show. cool_fox's launcher set it to 1,
   which made every texture keep its whole chain on the card. Off: re-uploads near zero, about 4 GB less commit,
   fewer freezes. This was the largest single gain.
-- The memory hooks (`-NoHooks` starts without them).
+- The memory hooks, only with `-Hooks` (see above).
 - `VICTORY_POOL_DISCARD=1`, `VICTORY_FILL_TITLE=1`, `VICTORY_PARTIAL_DELTA=1`, `VICTORY_BAKE_DELTA=1`,
   `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_POOL_CAP=1`: unused pool pages given back under low RAM, no read waits for
   fills, unchanged texture levels not uploaded again, the mapping lock taken per range, the texture pool capped.
 - `VICTORY_TABLE_MEMO=1`: a descriptor-table entry made ready earlier in a command list is not made ready again
   (81 % of about 54,000 entries a frame; verified against the full path). `VICTORY_LIST_ALIAS_EXACT=1`: a texture
   read through a view in another format follows its source's writes within a list (the base read a stale copy once
-  a frame in the title's lighting filter).
+  a frame in the title's lighting filter). `VICTORY_LIST_HOLD=1`: a view copied into a new table is held once
+  per list, not once per slot.
+- Picture waits: `VICTORY_BAKE_TEXTURES_MS=10000` (the title's character bake waits up to 10 s for its textures;
+  1.5 s by default: faces and skin came out wrong in some runs) and `VICTORY_PIPELINE_WAIT_MS=500` (a draw waits
+  for a pipeline still being made instead of being dropped after 20 ms).
 
 ## What was added to cool_fox
 
@@ -112,23 +124,34 @@ described above. Others:
 
 ## Known problems
 
-- Bushes and some trees glow purple; purple patches linger for a few seconds in some scenes (present in the base;
-  cause not found: `tools/docs/left-out-audit.md` lists the candidates).
-- Meshes can stretch for a second or two in busy scenes (seen before today's changes; another fork blames
-  `VICTORY_RELAY=2` with `VICTORY_CARD_STEPS=2`; not yet tested here).
-- Ray tracing is off by default: the base leaves the title's ray passes out unless `VICTORY_BVH_BUILDER=1`
-  (`CS_RaytracingResolve`, about 1,000 programs, and `CS_ScreenProbes_ActivateRays`). Those are all of the draws the
-  log reports as dropped. With it on the picture is sharper and better lit, and the card needs about 84 ms a frame
-  (`tools/docs/rt-parked-T.md`).
-- Heavy scenes sit at 16-21 fps: the layer's submitting thread is the limit (see above).
+- Bushes, trees and palms glow violet and some awnings turn bright blue with ray tracing off: the base leaves out the
+  title's probe-activation and ray-resolve programs, and the light probes then keep whatever their memory held.
+  `-ProbeRays` turns both programs back on without building a ray-tracing structure (every ray misses and gets the
+  title's own sky result): the glow is gone in our screenshots. It adds about 10,000 small dispatches a frame; a
+  cheaper form is being tested. `tools/docs/picture-defects-by-run.md`.
+- Purple patches can linger for a few seconds in some scenes; magenta or blue streaks, shiny skin or a dark band
+  across the eyes appear on characters in some runs. Candidates and evidence: `tools/docs/shading-gaps-audit.md`
+  (a material-class depth plane read before it is current, about once a frame; fix `VICTORY_PLANE_NOW=1`, untested).
+- Freezes of about a second at scene loads: the title's page-mapping copies cost one map and one unmap system call
+  per 64 KiB page, each slow in the kernel (114 of 122 slow calls in a 6-minute run, 13.7 s).
+  `tools/docs/freeze-analysis.md`.
+- The memory hooks (`-Hooks`) can draw a few small textures with old contents until their own check catches it
+  (7 in a 6-minute run). Off by default until fixed.
+- Heavy scenes sit at 16-21 fps: the layer's submitting thread is the limit (it walks about 55,000 pages a frame to
+  find about 2,000 changed ones; `VICTORY_REFRESH_STALE` is the fix in progress, verify mode only so far).
+- Meshes can stretch for a second or two in busy scenes (cause not found).
+- Ray tracing (`-RayTracing`) is off by default: sharper and better lit, but the card then needs about 84 ms a
+  frame (`tools/docs/rt-parked-T.md`).
 - Texture pop-in remains, less than before; the card reaches 14-15 GB of 16 in long sessions.
 - A first run on an empty shader cache can show missing or black faces.
 - In Series X mode the title always renders at 2560x1440 and upscales to 3840x2160 itself.
 - Two pipeline creation methods are not implemented (the title falls back to ordinary containers).
+- Fixed since the last state: a crash (a use after free in a meter thread that runs with the hooks).
 
 ## Where things are
 
 - `Play-Scarlett.cmd`, `scripts/play-scarlett.ps1`: the launcher.
+- `tools/docs/picture-settings-checklist.md`: every picture setting against another cool_fox build's.
 - `tools/`: the measuring scripts (`run-auto-coolfox.sh`: hands-off run with watchdog; `run-compare.sh`,
   `run-freezes.sh`, `run-focus.sh`), notes (`tools/docs`: what was measured, tried and rejected; `fox-port-*.md` list
   every ported switch; `cool-fox-willy-review.md` and `left-out-audit.md`: a settings audit and what the layer

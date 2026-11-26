@@ -733,6 +733,8 @@ impl Memory {
             if let Some(k) = self.copy_of(page)
                 && !self.pages.contains_key(&page)
             {
+                #[cfg(feature = "diagnostics")]
+                crate::host::refresh_kind(8);
                 self.copies[k].refresh(list, at, n);
                 self.copies[k].gpu_writes(list, at, n);
                 self.stats.back += 1;
@@ -745,9 +747,13 @@ impl Memory {
     /// it deferred so far (once until a copy of the title's intervenes).
     fn bring_up(&self, list: &HostList) {
         let (start, len) = self.directory.1.span();
+        #[cfg(feature = "diagnostics")]
+        crate::host::refresh_kind(8);
         self.directory.1.refresh(list, start, len);
         for shadow in &self.copies {
             let (start, len) = shadow.span();
+            #[cfg(feature = "diagnostics")]
+            crate::host::refresh_kind(8);
             shadow.refresh(list, start, len);
         }
     }

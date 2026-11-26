@@ -517,6 +517,62 @@ fn ei_line(frames: f64) {
     tracing::info!("execute_indirect per frame, all recording threads: {:.0} calls; {}", calls / frames, parts.join(", "));
 }
 
+// (Coder W, diagnostics) `host::Batch::flush_all` in parts, all flushes of the submitting thread:
+// 0 refresh-once notes, 1 final chunks, 2 known clean (few), 3 the ask ahead, 4 refreshes on the
+// workers (waited for), 5 refreshes one by one here, 6 the asking's end. Line every 5 s.
+
+const FL_PARTS: usize = 7;
+/// Per part ns; then flushes, refreshes in, refreshes left for 4/5, flushes that went wide.
+static FL: [std::sync::atomic::AtomicU64; FL_PARTS + 4] = [const { std::sync::atomic::AtomicU64::new(0) }; FL_PARTS + 4];
+
+pub(crate) struct FlushSplit(std::time::Instant);
+
+impl FlushSplit {
+    pub(crate) fn begin(refreshes: usize) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        FL[FL_PARTS].fetch_add(1, Relaxed);
+        FL[FL_PARTS + 1].fetch_add(refreshes as u64, Relaxed);
+        FlushSplit(std::time::Instant::now())
+    }
+    pub(crate) fn left(&mut self, n: usize) {
+        FL[FL_PARTS + 2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn part(&mut self, i: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = std::time::Instant::now();
+        FL[i].fetch_add((now - self.0).as_nanos() as u64, Relaxed);
+        if i == 4 {
+            FL[FL_PARTS + 3].fetch_add(1, Relaxed);
+        }
+        self.0 = now;
+        if i != 6 {
+            return;
+        }
+        static DUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+        let due = DUE.load(Relaxed);
+        if ms < due || DUE.compare_exchange(due, ms + 5000, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let frame = crate::frame::current();
+        let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed)).max(1) as f64;
+        let v: [u64; FL_PARTS + 4] = std::array::from_fn(|k| FL[k].swap(0, Relaxed));
+        const NAMES: [&str; FL_PARTS] =
+            ["refresh-once notes", "final chunks", "known clean (few)", "ask ahead", "on the workers", "one by one here", "asking's end"];
+        let parts: Vec<String> = (0..FL_PARTS).map(|k| format!("{} {:.2}", NAMES[k], v[k] as f64 / 1e6 / frames)).collect();
+        tracing::info!(
+            "flushes per frame (submitting thread): {:.1} flushes of {:.0} refreshes, {:.0} left after the known-clean look, {:.1} went to the workers; ms: {}",
+            v[FL_PARTS] as f64 / frames,
+            v[FL_PARTS + 1] as f64 / frames,
+            v[FL_PARTS + 2] as f64 / frames,
+            v[FL_PARTS + 3] as f64 / frames,
+            parts.join(", ")
+        );
+    }
+}
+
 // (Coder W, diagnostics) `State::bind` in parts: 0 textures picked by index (`early_textures`),
 // 1 heaps, depth, root signature, 2 pipeline and the stages' root arguments, tables and views.
 // (Fox T) Part 2 split further: 2 pipeline, half places, picks; 3 tables; 4 memory by
@@ -558,4 +614,34 @@ fn bind_line(frames: f64) {
     let parts: Vec<String> =
         (0..BIND_PARTS).map(|i| format!("{} {:.2} ms ({:.1} us a call)", NAMES[i], v[i] as f64 / 1e6 / frames, v[i] as f64 / 1e3 / calls)).collect();
     tracing::info!("bind per frame, all recording threads: {:.0} calls; {}", calls / frames, parts.join(", "));
+}
+
+// ---------------------------------------------------------------------------------------------
+// (Coder W, diagnostics) `Shadow::copy_stale` (REFRESH_STALE step 1): 64 KiB pages walked per
+// refresh, journal entries visited (written pages in the range), pages taken. Line every 5 s.
+
+static WALKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub(crate) fn walked(pages: usize, taken: usize, entries: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    WALKED[0].fetch_add(1, Relaxed);
+    WALKED[1].fetch_add(pages as u64, Relaxed);
+    WALKED[2].fetch_add(taken as u64, Relaxed);
+    WALKED[3].fetch_add(entries as u64, Relaxed);
+    static DUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !line_due(&DUE) {
+        return;
+    }
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed)).max(1) as f64;
+    let v: [u64; 4] = std::array::from_fn(|i| WALKED[i].swap(0, Relaxed));
+    tracing::info!(
+        "refresh walks per frame (copy_stale): {:.0} walks over {:.0} pages ({:.0} journal entries visited), {:.0} pages taken ({:.2} % of those walked)",
+        v[0] as f64 / frames,
+        v[1] as f64 / frames,
+        v[3] as f64 / frames,
+        v[2] as f64 / frames,
+        v[2] as f64 * 100.0 / v[1].max(1) as f64
+    );
 }

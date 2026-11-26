@@ -7771,6 +7771,43 @@ impl<'a> Lower<'a> {
     /// pixel does not stay in a history the title blends into each frame (glowing eyes, white
     /// shots). `strict` (colour targets): every NaN. Otherwise (typed stores, only with
     /// `VICTORY_NAN_GUARD_STORES=1`) only the NaNs the GPU makes and infinities.
+    /// (Fox T, `VICTORY_NAN_METER=1`) Counts `f` in the program's place of the
+    /// [`super::SLOT_NAN`] buffer if it is a NaN or an infinity, for lanes that
+    /// run (`guard`): dword 0 NaNs, 1 infinities of typed stores; 2, 3 of colour
+    /// exports (`export`).
+    fn nan_meter(&mut self, f: V, guard: Option<V>, export: bool) {
+        if !super::nan_meter() || self.s.mesh.is_some() {
+            return;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, abs, inf_bits);
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let mut any = self.s.m.bin(c, Bin::Or, nan, inf);
+        if let Some(g) = guard {
+            any = self.s.m.bin(c, Bin::And, any, g);
+        }
+        let gate = self.begin_guarded(Some(any));
+        let c = self.cur;
+        let slot = self.host_word(RootType::Other(super::USER_NAN_SLOT), 0, 0);
+        let last = self.s.m.i32(super::NAN_SLOTS - 1);
+        let slot = self.s.m.bin(c, Bin::And, slot, last);
+        let (k16, k4, k8) = (self.s.m.i32(16), self.s.m.i32(4), self.s.m.i32(if export { 8 } else { 0 }));
+        let base = self.s.m.bin(c, Bin::Mul, slot, k16);
+        let base = self.s.m.bin(c, Bin::Add, base, k8);
+        let zero = self.s.m.i32(0);
+        let which = self.s.m.select(c, nan, zero, k4);
+        let byte = self.s.m.bin(c, Bin::Add, base, which);
+        let h = self.s.root_uav_handle(super::SLOT_NAN);
+        let (i32t, one) = (self.s.t.i32, self.s.m.i32(1));
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, zero, byte, iu, iu, one]);
+        self.end_guarded(gate, &[]);
+    }
+
     fn nan_guard(&mut self, f: V, strict: bool) -> V {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
@@ -11462,6 +11499,10 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            // (Fox T, `VICTORY_NAN_METER`) What the program stores, counted.
+            for &v in &vals {
+                self.nan_meter(v, guard, false);
+            }
             // (`VICTORY_NAN_GUARD_STORES=1` only)
             let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
             let h = self.handle(site, src, false, props)?;
@@ -12480,6 +12521,7 @@ impl<'a> Lower<'a> {
                         args.push(x);
                     } else {
                         let f = self.as_float(x);
+                        self.nan_meter(f, guard, false);
                         args.push(self.nan_guard(f, false));
                     }
                 }
@@ -12881,6 +12923,9 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            if target {
+                self.nan_meter(x, None, true);
+            }
             let x = if target { self.nan_guard(x, true) } else { x };
             let sig = if primitive { id as u32 } else { self.sig_id(false, id) };
             let mut args = vec![

@@ -1,5 +1,5 @@
-# Starts the title with this branch's current settings and memory hooks (the set the README's figures are
-# measured with): Series X mode, or Series S with DLSS (-OptiScaler and -Dlss).
+# Starts the title with this branch's current settings: Series X mode, or Series S with DLSS (-OptiScaler
+# and -Dlss).
 #
 #   .\scripts\play-scarlett.ps1 -Game 'D:\Games\MyDump'
 #
@@ -12,7 +12,11 @@
 # -Data        saves (default: %LOCALAPPDATA%\victory-scarlett\data)
 # -RayTracing  the title's own ray tracing (VICTORY_BVH_BUILDER=1): better light, much slower. Off by default.
 # -AutoStart   presses through the start screens by itself, for a fresh start with no save
-# -NoHooks     without the memory hooks: the first thing to try if something looks wrong
+# -ProbeRays   removes the violet glow on bushes, trees and palms that the base shows with ray tracing off
+#              (the title's light probes are activated and their rays resolved as misses; no ray-tracing
+#              structure is built). Costs frame time; the first start with it builds about 1,000 pipelines.
+# -Hooks       with the memory hooks: faster, but they can show a few small textures with old contents for a
+#              moment. Off by default until that is fixed.
 # -CardSteps   0, 1 or 2 (default 2): which steps that read memory still in flight are done on the card.
 #              2 also does the title's buffer copies there; the skinning passes write that memory and
 #              earlier reviews saw bodies stretch with it. 1 is the first thing to try if meshes stretch.
@@ -35,6 +39,8 @@ param(
     [string]$Data = '',
     [switch]$RayTracing,
     [switch]$AutoStart,
+    [switch]$ProbeRays,
+    [switch]$Hooks,
     [switch]$NoHooks,
     [ValidateSet('0', '1', '2')][string]$CardSteps = '2',
     [ValidateRange(0.2, 1.0)][double]$RenderScale = 0,
@@ -110,7 +116,7 @@ $set = [ordered]@{
     # The standing set of this fork's runs (some names come from its older tree and are ignored here)
     VICTORY_JOIN_COPIES = '1'; VICTORY_REFRESH_ONCE = '1'; VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_BACK_OWN_VIEW = '1'
     VICTORY_WIDE_MERGE = '1'; VICTORY_MIRROR_FAST = '1'; VICTORY_FRAME_LOG = '1'; VICTORY_CARD_METER = '1'
-    VICTORY_PIPELINE_WAIT_MS = '20'; VICTORY_ASYNC_SUBMIT = '1'; VICTORY_QUEUE2 = '1'; VICTORY_INDIRECT_WINDOW = '1'
+    VICTORY_PIPELINE_WAIT_MS = '500'; VICTORY_ASYNC_SUBMIT = '1'; VICTORY_QUEUE2 = '1'; VICTORY_INDIRECT_WINDOW = '1'
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_COPY_PLAIN = '1'; VICTORY_WIDE_TEXTURES = '1'; VICTORY_INDIRECT_GATHER = '1'
     VICTORY_LATE_WAIT_LISTS = '1024'; VICTORY_CARD_FILLS_BATCH = '0'; VICTORY_GATHER_DISPATCH = '0'
 
@@ -128,13 +134,17 @@ $set = [ordered]@{
 
     # Draw set-up: table entries done earlier in a list are not done again; an aliased texture's copy follows its
     # source's writes within a list (a stale read in the base)
-    VICTORY_TABLE_MEMO = '1'; VICTORY_LIST_ALIAS_EXACT = '1'
+    VICTORY_TABLE_MEMO = '1'; VICTORY_LIST_ALIAS_EXACT = '1'; VICTORY_LIST_HOLD = '1'
+
+    # Picture: the title's character bake waits up to 10 s for its textures (1.5 s by default), and a draw
+    # waits up to 500 ms for a pipeline still being made (above) instead of being dropped after 20 ms
+    VICTORY_BAKE_TEXTURES_MS = '10000'
 
     # Every NaN and infinity that image and buffer stores write is made 0 / +-65504 (=1 takes only the
     # NaN an AMD card makes; an NVIDIA card's NaN went through and drew the sun black)
     VICTORY_NAN_GUARD_STORES = '2'
 }
-if (-not $NoHooks) {
+if ($Hooks -and -not $NoHooks) {
     # The memory hooks
     $set.VICTORY_GPU_ONLY = '1'; $set.VICTORY_KNOWN_WRITES = '1'
 }
@@ -151,6 +161,7 @@ if ($Dlss) {
     $console = @('--console', 'series-s')
     $mode = "Series S with DLSS (preset $DlssPreset)"
 }
+if ($ProbeRays -and -not $RayTracing) { $set.VICTORY_ACTIVATE_RAYS = '1'; $set.VICTORY_RT_RESOLVE = '1' }
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
 if ($AutoStart) {
     $set.VICTORY_AUTO_INPUT = 'd>=15,rep(A,1,d<10),w3,d>=20,w1,rep(A,1,d>=35),w1.5,Down,w7,Down,w0.6,A,w1.5,A,w0.7,Down,w0.5,A,w0.7,Down,w0.5,A'
@@ -168,7 +179,7 @@ if ($freeGB -lt 16) {
         ForEach-Object { Write-Warning ("  {0}: {1:N1} GB" -f $_.Name, ($_.PrivateMemorySize64 / 1GB)) }
 }
 Write-Host ("{0} mode, {1} build, ray tracing {2}, memory hooks {3}, render scale {4}" -f $mode, $Build,
-    $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($NoHooks) { 'off' } else { 'on' }),
+    $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($Hooks -and -not $NoHooks) { 'on' } else { 'off' }),
     $(if ($RenderScale -gt 0) { $RenderScale } else { "the title's" }))
 Write-Host "Cache: $Cache"
 Write-Host "Saves: $Data"
