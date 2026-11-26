@@ -1,5 +1,5 @@
-# Starts the title in Series X mode with this branch's current settings and memory hooks
-# (the set the README's figures are measured with).
+# Starts the title with this branch's current settings and memory hooks (the set the README's figures are
+# measured with): Series X mode, or Series S with DLSS (-OptiScaler and -Dlss).
 #
 #   .\scripts\play-scarlett.ps1 -Game 'D:\Games\MyDump'
 #
@@ -16,7 +16,15 @@
 # -CardSteps   0, 1 or 2 (default 2): which steps that read memory still in flight are done on the card.
 #              2 also does the title's buffer copies there; the skinning passes write that memory and
 #              earlier reviews saw bodies stretch with it. 1 is the first thing to try if meshes stretch.
-# -More       other settings, last word: -More @{ VICTORY_LOG = 'warn' }
+# -RenderScale the title's internal render scale, 0.2-1.0 of the output (VICTORY_RENDER_SCALE; the title's own
+#              is 2/3: 2560x1440 of 3840x2160). 0.5 = 1920x1080 in Series X mode: fewer pixels for the card and
+#              about 1 GB less in render targets. With -Dlss only 0.5, 0.4, 1/3 (0.3333) and 0.75 reach DLSS.
+# -OptiScaler  the folder of an extracted OptiScaler release, and
+# -Dlss        NVIDIA's nvngx_dlss.dll: DLSS in place of the title's upscaler (cool_fox's route,
+#              VICTORY_FSR_DLL). The title calls that upscaler only as a Series S, so this starts in Series S mode
+#              (720p upscaled to 1080p unless -RenderScale). OptiScaler is set up in target\<Build>\opti.
+# -DlssPreset  DLSS render preset with -Dlss (default 11 = K, the transformer model; 0 = DLSS's own choice)
+# -More        other settings, last word: -More @{ VICTORY_LOG = 'warn' }
 #
 # Run it from a normal window, not as administrator.
 param(
@@ -29,9 +37,49 @@ param(
     [switch]$AutoStart,
     [switch]$NoHooks,
     [ValidateSet('0', '1', '2')][string]$CardSteps = '2',
+    [ValidateRange(0.2, 1.0)][double]$RenderScale = 0,
+    [string]$OptiScaler = '',
+    [string]$Dlss = '',
+    [ValidateRange(0, 15)][int]$DlssPreset = 11,
     [hashtable]$More = @{}
 )
 $ErrorActionPreference = 'Stop'
+if ([bool]$OptiScaler -ne [bool]$Dlss) { throw 'DLSS needs both -OptiScaler <folder> and -Dlss <nvngx_dlss.dll>.' }
+
+function Set-IniValue([string]$Text, [string]$Section, [string]$Key, [string]$Value) {
+    $lines = $Text -split "`r?`n"
+    $in = $false; $done = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\[(.+)\]\s*$') { $in = ($Matches[1] -eq $Section); continue }
+        if ($in -and -not $done -and $lines[$i] -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) { $lines[$i] = "$Key=$Value"; $done = $true }
+    }
+    if (-not $done) { Write-Warning "OptiScaler.ini: no $Key in [$Section]" }
+    $lines -join "`r`n"
+}
+
+# A copy of victory.exe in a folder of its own with OptiScaler as its dxgi.dll and the DLSS DLL beside it (cool_fox's
+# Play-DLSS.ps1). OptiScaler takes the PC FidelityFX calls the title's upscaler is sent to and runs DLSS instead.
+function Initialize-Opti([string]$Exe, [string]$OptiDir, [string]$DlssDll, [int]$Preset) {
+    $to = Join-Path (Split-Path $Exe -Parent) 'opti'
+    New-Item -ItemType Directory -Force $to | Out-Null
+    Get-ChildItem $OptiDir -File | Where-Object { $_.Extension -in '.dll', '.ini' -and $_.Name -ne 'OptiScaler.ini' } | Copy-Item -Destination $to -Force
+    Get-ChildItem $OptiDir -Directory | Where-Object { $_.Name -ne 'Licenses' } | Copy-Item -Destination $to -Recurse -Force
+    Copy-Item (Join-Path $OptiDir 'OptiScaler.dll') (Join-Path $to 'dxgi.dll') -Force
+    Remove-Item (Join-Path $to 'OptiScaler.dll') -Force -ErrorAction SilentlyContinue
+    Copy-Item $DlssDll (Join-Path $to 'nvngx_dlss.dll') -Force
+    $iniPath = Join-Path $to 'OptiScaler.ini'
+    if (-not (Test-Path -LiteralPath $iniPath -PathType Leaf)) { Copy-Item -LiteralPath (Join-Path $OptiDir 'OptiScaler.ini') -Destination $iniPath }
+    $ini = Get-Content -LiteralPath $iniPath -Raw
+    $ini = Set-IniValue $ini 'Upscalers' 'Dx12Upscaler' 'dlss'
+    $ini = Set-IniValue $ini 'FrameGen' 'Enabled' 'false'
+    $ini = Set-IniValue $ini 'FrameGen' 'FGInput' 'nofg'
+    $ini = Set-IniValue $ini 'FrameGen' 'FGOutput' 'nofg'
+    $ini = Set-IniValue $ini 'DLSS' 'RenderPresetOverride' ($(if ($Preset -gt 0) { 'true' } else { 'false' }))
+    $ini = Set-IniValue $ini 'DLSS' 'RenderPresetForAll' ([string]$Preset)
+    Set-Content -LiteralPath $iniPath -Value $ini -NoNewline
+    Copy-Item $Exe (Join-Path $to 'victory.exe') -Force
+    $to
+}
 $root = Split-Path -Parent $PSScriptRoot
 $remembered = Join-Path $root 'game-folder.txt'
 
@@ -91,6 +139,18 @@ if (-not $NoHooks) {
     $set.VICTORY_GPU_ONLY = '1'; $set.VICTORY_KNOWN_WRITES = '1'
 }
 $set.VICTORY_CARD_STEPS = $CardSteps
+if ($RenderScale -gt 0) { $set.VICTORY_RENDER_SCALE = $RenderScale.ToString([Globalization.CultureInfo]::InvariantCulture) }
+$console = @()
+$mode = 'Series X'
+if ($Dlss) {
+    $optiDir = (Resolve-Path -LiteralPath $OptiScaler).Path
+    if (-not (Test-Path -LiteralPath (Join-Path $optiDir 'OptiScaler.dll'))) { throw "No OptiScaler.dll in $optiDir" }
+    $opti = Initialize-Opti $Victory $optiDir (Resolve-Path -LiteralPath $Dlss).Path $DlssPreset
+    $Victory = Join-Path $opti 'victory.exe'
+    $set.VICTORY_FSR_DLL = Join-Path $opti 'amd_fidelityfx_dx12.dll'
+    $console = @('--console', 'series-s')
+    $mode = "Series S with DLSS (preset $DlssPreset)"
+}
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
 if ($AutoStart) {
     $set.VICTORY_AUTO_INPUT = 'd>=15,rep(A,1,d<10),w3,d>=20,w1,rep(A,1,d>=35),w1.5,Down,w7,Down,w0.6,A,w1.5,A,w0.7,Down,w0.5,A,w0.7,Down,w0.5,A'
@@ -107,8 +167,10 @@ if ($freeGB -lt 16) {
     Get-Process | Where-Object { $_.Name -ne 'victory' } | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 5 |
         ForEach-Object { Write-Warning ("  {0}: {1:N1} GB" -f $_.Name, ($_.PrivateMemorySize64 / 1GB)) }
 }
-Write-Host ("Series X mode, {0} build, ray tracing {1}, memory hooks {2}" -f $Build, $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($NoHooks) { 'off' } else { 'on' }))
+Write-Host ("{0} mode, {1} build, ray tracing {2}, memory hooks {3}, render scale {4}" -f $mode, $Build,
+    $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($NoHooks) { 'off' } else { 'on' }),
+    $(if ($RenderScale -gt 0) { $RenderScale } else { "the title's" }))
 Write-Host "Cache: $Cache"
 Write-Host "Saves: $Data"
-& $Victory run $exe --execute
+& $Victory run $exe --execute @console
 exit $LASTEXITCODE
