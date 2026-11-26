@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `VICTORY_REFRESH_STALE=verify`.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_STALE").is_ok_and(|v| v == "verify"))
+    // (W) Under `=1` too: its one-in-64 refreshes the old way are checked and the line printed.
+    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_STALE").is_ok_and(|v| v == "verify" || v == "1"))
 }
 
 /// Refreshes checked, pages today's look took, pages the stale set lacked,

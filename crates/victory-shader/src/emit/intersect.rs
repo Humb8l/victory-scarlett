@@ -25,7 +25,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, RootType, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -122,6 +122,25 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        // (Fox T, `VICTORY_PROBE_RAYS`) An empty structure (the host says so):
+        // no node is read, and the answer is that of an empty one (below).
+        let empty = crate::emit::probe_rays().then(|| {
+            let flag = self.host_word(RootType::Other(crate::emit::USER_BVH_EMPTY), 0, 0);
+            let zero = self.s.m.i32(0);
+            self.s.m.cmp(self.cur, pred::NE, flag, zero)
+        });
+        let whole_guard = guard;
+        let guard = match (empty, guard) {
+            (Some(e), g) => {
+                let t = self.s.m.bool(true);
+                let not_empty = self.s.m.bin(self.cur, Bin::Xor, e, t);
+                Some(match g {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, not_empty),
+                    None => not_empty,
+                })
+            }
+            (None, g) => g,
+        };
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -225,9 +244,24 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, zero));
         }
-        let results = self.end_guarded(gate, &results);
+        let mut results = self.end_guarded(gate, &results);
+        if let Some(e) = empty {
+            // A box node of an empty structure has no children; anything else
+            // is missed.
+            let c = self.cur;
+            let (k7, k6, k4) = (self.s.m.i32(7), self.s.m.i32(6), self.s.m.i32(4));
+            let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+            let pair = self.s.m.bin(c, Bin::And, kind, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            for (k, r) in results.iter_mut().enumerate() {
+                let none = self.s.m.i32(bvh::NONE);
+                let miss = self.s.m.i32(bvh::MISS[k].to_bits());
+                let answer = self.s.m.select(c, is_box, none, miss);
+                *r = self.s.m.select(c, e, answer, *r);
+            }
+        }
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            self.write(inst, Reg::V(dst + k as u8), r, whole_guard);
         }
         Ok(())
     }

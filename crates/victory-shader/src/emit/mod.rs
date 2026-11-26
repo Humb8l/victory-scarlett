@@ -130,7 +130,7 @@ pub use PAIRED_BEFORE_WIDE as WAVE_PAIRED_BEFORE_WIDE;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_NAN_SLOT, SLOT_NAN, NAN_SLOTS, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_NAN_SLOT, USER_BVH_EMPTY, SLOT_NAN, NAN_SLOTS, NAN_ORIGIN_DWORDS, NAN_ORIGINS, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -208,6 +208,52 @@ pub fn builder_fences() -> bool {
 pub fn bvh_walk() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
+}
+
+/// (Fox T) A program's tag: FNV-1a of its console code, as the inspect tool and
+/// `VICTORY_NAN_ORIGIN` name it.
+pub fn code_tag(code: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in code {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// (Fox T, a meter, with `VICTORY_NAN_METER=1`) `VICTORY_NAN_ORIGIN=<tag>[,<tag>...]` (hex, at
+/// most [`NAN_ORIGINS`]): in those programs every float result of a vector ALU instruction
+/// that is NaN counts itself at the instruction's dword in the [`SLOT_NAN`] buffer
+/// (after the programs' counts): the first instruction in the code with a count is where the
+/// NaN is made (from operands that were numbers) or first read (from memory).
+pub fn nan_origin(code: &[u8]) -> Option<u32> {
+    static TAGS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let tags = TAGS.get_or_init(|| {
+        std::env::var("VICTORY_NAN_ORIGIN")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|t| u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .take(NAN_ORIGINS as usize)
+            .collect()
+    });
+    if tags.is_empty() || !nan_meter() {
+        return None;
+    }
+    let tag = code_tag(code);
+    tags.iter().position(|&t| t == tag).map(|i| i as u32)
+}
+
+/// (Fox T) `VICTORY_PROBE_RAYS=1` (default off): with the ray-tracing structure builder off,
+/// the title's screen probes still trace their rays (`CS_ScreenProbes_ActivateRays` runs, so
+/// no probe keeps the stale memory that showed as violet vegetation), and every node test
+/// (`image_bvh_intersect_ray`) answers as against an empty structure, which the host says
+/// with [`USER_BVH_EMPTY`]: a box node's four children are none, a triangle is missed. The
+/// title's traversal then ends at its first node with the miss it computes for a ray that
+/// finds nothing, instead of walking a structure that was never built. Part of the
+/// translation: the shader cache keys on it.
+pub fn probe_rays() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROBE_RAYS").is_some_and(|v| v == "1"))
 }
 
 /// (Fox T, a meter) `VICTORY_NAN_METER=1`: every float a program stores through a typed view

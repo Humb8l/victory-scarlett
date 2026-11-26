@@ -2,7 +2,7 @@
 rem Starts the title with this branch's current settings (scripts\play-scarlett.ps1).
 rem Drag your dump's folder (the one with game_scarlett_master.exe) onto this file the first time;
 rem it is remembered in game-folder.txt, so a double-click is enough afterwards.
-rem Other options: see the top of scripts\play-scarlett.ps1 (for example -ProbeRays, -RayTracing, -Hooks, -AutoStart).
+rem Other options: see the top of scripts\play-scarlett.ps1 (for example -RayTracing, -Hooks, -AutoStart).
 setlocal
 cd /d "%~dp0"
 if "%~1"=="" (

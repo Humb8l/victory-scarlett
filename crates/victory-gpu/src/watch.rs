@@ -304,7 +304,7 @@ fn bump_block(block: usize) {
 }
 
 /// (Coder W) `VICTORY_REFRESH_STALE`: every journal note, in order, per region of 1 GiB of
-/// title address space (64 KiB pages; the same page noted twice on end is kept once). A copy
+/// title address space (64 KiB pages, each note with its asking). A copy
 /// reads what was added over its span since it last read ([`stalelog::pull`]) and marks those
 /// pages stale: what the journal has noted since, whatever noted it (askings, guards, our writes,
 /// landings, other views noted by their callers). A region keeps its last `KEEP` notes; a copy
@@ -316,7 +316,7 @@ pub(crate) mod stalelog {
 
     /// Pages of a region (1 GiB).
     pub(crate) const REGION: usize = 1 << 14;
-    const KEEP: usize = 1 << 17;
+    const KEEP: usize = 1 << 19;
 
     /// 0 off, 1 on, 2 verify.
     pub(crate) fn mode() -> u8 {
@@ -345,12 +345,8 @@ pub(crate) mod stalelog {
         let (region, at) = (page / REGION, (page % REGION) as u32);
         let mut log = LOG.write().unwrap_or_else(|e| e.into_inner());
         let r = log.get_or_insert_with(HashMap::new).entry(region).or_insert(Region { first: 0, pages: VecDeque::new() });
-        if let Some(last) = r.pages.back_mut()
-            && last.0 == at
-        {
-            last.1 = last.1.max(asking);
-            return;
-        }
+        // (No folding of a repeat into the last entry: a copy may have read that one already, and
+        // would never see the repeat; run-237's remaining misses.)
         if r.pages.len() >= KEEP {
             r.pages.pop_front();
             r.first += 1;
@@ -398,6 +394,29 @@ pub(crate) mod stalelog {
         }
         later
     }
+}
+
+/// (Coder W, `VICTORY_REFRESH_STALE=1`) The number `writes` would answer `[start, end)` with from
+/// the journal alone (its blocks known by their bits, or the submission's asking holds it), with
+/// nothing asked; `None` if it would ask the kernel or the guards.
+pub(crate) fn journal_answer(start: usize, end: usize) -> Option<u64> {
+    if !light() {
+        return None;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if published(start, end) {
+        let _j = journal();
+        return Some(next_asking());
+    }
+    let j = journal();
+    j.ahead.holds(first, last).then_some(j.ahead_asked)
+}
+
+/// (Coder W, `VICTORY_REFRESH_STALE=1`) The asking that last found each of `pages` written (0:
+/// never), as the journal has it.
+pub(crate) fn last_written(pages: &[usize]) -> Vec<u64> {
+    let j = journal();
+    pages.iter().map(|p| j.written.get(p).copied().unwrap_or(0)).collect()
 }
 
 /// Whether no block of `[start, end)` changed after number `n` ([`BlockSeqs`]).

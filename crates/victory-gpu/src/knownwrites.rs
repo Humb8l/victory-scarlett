@@ -836,7 +836,7 @@ const NOT_NAMES: [&str; 6] = [
 ];
 /// `=1`, since the line: pages of the refreshes the filter looked at that it
 /// did not spare, by the first reason that holds.
-static PAGES_NOT: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static PAGES_NOT: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const P_NOT_TAKEN: usize = 0;
 const P_TABLE_FULL: usize = 1;
 const P_HEAP: usize = 2;
@@ -848,7 +848,12 @@ const P_MARKED: usize = 7;
 const P_INFLIGHT: usize = 8;
 const P_MAPPED_RECENT: usize = 9;
 const P_WINDOW: usize = 10;
-const P_NAMES: [&str; 11] = [
+/// (Coder W) In the streaming regions (the title's variables; all pages while unknown): remapped
+/// through the GPU view with no event of the filter's (run-231's misses).
+const P_STREAMING: usize = 11;
+/// (Coder W) Last marked by a landing or a mapping change, however long ago.
+const P_MARK_KIND: usize = 12;
+const P_NAMES: [&str; 13] = [
     "never taken or in part",
     "table full",
     "graphics heap",
@@ -860,6 +865,8 @@ const P_NAMES: [&str; 11] = [
     "landing in flight",
     "mapping change in the last frames",
     "lock window open",
+    "in the streaming regions",
+    "last marked by a landing or a mapping change",
 ];
 
 /// (`Shadow::update_free`, `=1`) A refresh the filter will not look at, for `reason`.
@@ -988,7 +995,8 @@ pub(crate) fn spared(pages: &[(usize, u64)], from: usize, to: usize) -> Vec<bool
         w.open.range(a.saturating_sub(w.longest)..b).filter(|(_, v)| v.0 > a).map(|(&k, v)| (k, v.0)).collect()
     };
     let mut sums = [0u64; 33];
-    let mut not = [0u64; 11];
+    let mut not = [0u64; 13];
+    let streaming = crate::pagekinds::streaming();
     let out: Vec<bool> = pages
         .iter()
         .map(|&(page, taken)| {
@@ -999,6 +1007,17 @@ pub(crate) fn spared(pages: &[(usize, u64)], from: usize, to: usize) -> Vec<bool
                 let address = (page * PAGE) as u64;
                 if c1 != 0 && address >= c0 && address < c0 + c1 || address >= h0 && address < h1 {
                     return Some(P_HEAP);
+                }
+                match streaming {
+                    // (The unit tests have no runtime to tell the regions.)
+                    None if cfg!(test) => {}
+                    None => return Some(P_STREAMING),
+                    Some(((a0, a1), (b0, b1))) => {
+                        let at = page * PAGE;
+                        if (a0..a1).contains(&at) || (b0..b1).contains(&at) {
+                            return Some(P_STREAMING);
+                        }
+                    }
                 }
                 let Some(c) = chunk(page, true) else { return Some(P_TABLE_FULL) };
                 let i = page % CHUNK_PAGES;
@@ -1021,6 +1040,9 @@ pub(crate) fn spared(pages: &[(usize, u64)], from: usize, to: usize) -> Vec<bool
                 }
                 if c.inflight[i].load(Relaxed) != 0 {
                     return Some(P_INFLIGHT);
+                }
+                if stamp != 0 && matches!(c.src[i].load(Relaxed), SRC_LANDING | SRC_MAPPED) {
+                    return Some(P_MARK_KIND);
                 }
                 if c.src[i].load(Relaxed) == SRC_MAPPED {
                     let f = c.frame[i].load(Relaxed);

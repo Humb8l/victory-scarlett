@@ -8954,7 +8954,9 @@ impl Batch {
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
+                let at = std::time::Instant::now();
                 due[i].refresh();
+                crate::copystep::rsplit(crate::copystep::R_TEXTURES, at, 0);
                 return;
             };
             let (shadow, from, to) = &spans[i];
@@ -9502,9 +9504,14 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {
+        let at = crate::copystep::split_on().then(std::time::Instant::now);
         // SAFETY: the destination is mapped writable memory of `len` bytes;
         // a source page that is not there fails the copy.
-        return unsafe { crate::safecopy::copy(dst, src, len) };
+        let done = unsafe { crate::safecopy::copy(dst, src, len) };
+        if let Some(at) = at {
+            crate::copystep::rsplit(crate::copystep::R_READ, at, len);
+        }
+        return done;
     }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
@@ -9865,6 +9872,14 @@ impl Meter {
         crate::draw::bind_same_line(frames);
         crate::draw::table_memo_line(frames);
         crate::draw::list_alias_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::draw::cross_frame_line(frames);
+        if victory_shader::emit::probe_rays() {
+            tracing::info!(
+                "probe rays (VICTORY_PROBE_RAYS=1): {:.1} binds a frame of programs whose node tests answer as for an empty structure (the builder is off)",
+                crate::draw::PROBE_EMPTY.swap(0, Ordering::Relaxed) as f64 / frames
+            );
+        }
         {
             let [late, now] = [0, 1].map(|i| PLANE_LATE[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if late > 0.0 {

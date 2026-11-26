@@ -110,6 +110,11 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// (Fox T, `VICTORY_NAN_METER=1`) `RootType::Other` code of a user-data dword
 /// the host sets: the program's place in the [`SLOT_NAN`] buffer.
 pub const USER_NAN_SLOT: u32 = 0x107;
+/// (Fox T, `VICTORY_PROBE_RAYS=1`) `RootType::Other` code of a user-data dword
+/// the host sets: nonzero while the title's ray-tracing structures are not
+/// built (the structure builder is off). A node test then answers as for a
+/// structure with nothing in it.
+pub const USER_BVH_EMPTY: u32 = 0x108;
 /// (Fox T, `VICTORY_NAN_METER=1`) The root UAV `u<SLOT_NAN>` in
 /// [`ROOT_CBV_SPACE`]: per program ([`USER_NAN_SLOT`]) four dwords: NaNs and
 /// infinities stored through typed views (images, typed buffers), NaNs and
@@ -118,6 +123,12 @@ pub const USER_NAN_SLOT: u32 = 0x107;
 pub const SLOT_NAN: u8 = 250;
 /// Programs the [`SLOT_NAN`] buffer has room for.
 pub const NAN_SLOTS: u32 = 1 << 14;
+/// (Fox T, `VICTORY_NAN_ORIGIN`) After the programs' counts, per program named
+/// there (by its code's tag, [`code_tag`]), one dword per instruction dword of
+/// its code: how many float results that instruction made that are NaN.
+pub const NAN_ORIGIN_DWORDS: u32 = 1 << 14;
+/// Programs `VICTORY_NAN_ORIGIN` can name.
+pub const NAN_ORIGINS: u32 = 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

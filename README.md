@@ -15,12 +15,25 @@ no game files, code or assets.**
 3. **Start the game.** Drag your game folder onto **`Play-Scarlett.cmd`**.
    After the first time, just double-click `Play-Scarlett.cmd`: it remembers the folder.
 
-That is all. `Play-Scarlett.cmd` sets every setting this branch runs with, in Series X mode.
+That is all. `Play-Scarlett.cmd` sets every setting this branch runs with, in Series X mode. The first start
+takes a few extra minutes while it prepares the game's shaders (see below); after that it starts straight away.
 
 Good to know:
 
-- **The first start is slow** and can show missing faces: the game's shaders are translated once and kept. From the
-  second start on it is right.
+- **Shaders are prepared ahead, by itself.** Before the game starts, the launcher translates all of the game's
+  shaders once (`victory.exe shaders <your game folder>\shaders.rpf`). You will see a console window counting
+  for a few minutes. It happens only when it is needed:
+  - on the first start,
+  - after you build a new `victory.exe`,
+  - after you change a setting that changes the shaders (`-RayTracing`, `-NoProbeRays`).
+
+  It is remembered in the cache folder (`scarlett-shaders-ahead.txt`), so every other start skips it. Without
+  this step the game would translate shaders while you play: slow, with objects missing and faces drawn wrong
+  for that session. To run only this step: `.\scripts\play-scarlett.ps1 -OnlyPrecompile`. To skip it:
+  `-NoPrecompile`. To force it again, delete `scarlett-shaders-ahead.txt` from the cache folder
+  (`%LOCALAPPDATA%\victory-scarlett\cache` unless you chose another).
+- **The first session still stutters a little** while the graphics driver builds its own pipelines; later
+  sessions are smoother.
 - **Controls:** an Xbox controller works. On the keyboard: W A S D move, I J K L camera, Enter = A, Backspace = B,
   X and Y, Z / C = left / right trigger, Q / E = LB / RB, arrows = D-pad, Esc = Menu, Tab = View.
 - **Do not use `Play-VIctory.cmd`** for this: that is the base's launcher, with Series S and other settings.
@@ -30,13 +43,8 @@ Good to know:
   .\scripts\play-scarlett.ps1 -RayTracing
   ```
 
-- **Bushes, trees and palms glow violet?** That is the base's picture with ray tracing off. This removes it
-  (it costs some frame time, and the first start with it is slow):
-
-  ```powershell
-  .\scripts\play-scarlett.ps1 -ProbeRays
-  ```
-
+- **The violet glow on bushes, trees and palms** that the base shows with ray tracing off is gone by default
+  (`-NoProbeRays` brings the base's picture back). The first start after this update re-translates shaders.
 - **More speed:** `.\scripts\play-scarlett.ps1 -Hooks` turns the memory hooks on (about 10-15 ms a frame less in
   the opening scenes). They are off by default: they can show a few small textures with old contents for a moment.
 - More options are listed at the top of `scripts\play-scarlett.ps1` (other cache or save folders, a release build,
@@ -124,26 +132,31 @@ described above. Others:
 
 ## Known problems
 
-- Bushes, trees and palms glow violet and some awnings turn bright blue with ray tracing off: the base leaves out the
-  title's probe-activation and ray-resolve programs, and the light probes then keep whatever their memory held.
-  `-ProbeRays` turns both programs back on without building a ray-tracing structure (every ray misses and gets the
-  title's own sky result): the glow is gone in our screenshots. It adds about 10,000 small dispatches a frame; a
-  cheaper form is being tested. `tools/docs/picture-defects-by-run.md`.
+- Fixed by default: the violet glow on bushes, trees and palms and the bright blue awnings with ray tracing off.
+  The base leaves out the title's probe-activation program, and the light probes then keep whatever their
+  memory held. `VICTORY_PROBE_RAYS=1` (set by the launcher) runs it and answers every ray test as for an empty
+  structure, so each ray ends with the title's own miss result; no cost measured.
 - Purple patches can linger for a few seconds in some scenes; magenta or blue streaks, shiny skin or a dark band
   across the eyes appear on characters in some runs. Candidates and evidence: `tools/docs/shading-gaps-audit.md`
-  (a material-class depth plane read before it is current, about once a frame; fix `VICTORY_PLANE_NOW=1`, untested).
-- Freezes of about a second at scene loads: the title's page-mapping copies cost one map and one unmap system call
-  per 64 KiB page, each slow in the kernel (114 of 122 slow calls in a 6-minute run, 13.7 s).
+  (a material-class depth plane was read before it was current, once a frame: fixed by `VICTORY_PLANE_NOW=1`,
+  set by the launcher; two compute passes make NaNs: ambient occlusion and a far-depth downsample, being traced).
+- Freezes of about a second at scene loads: the title's page-mapping copies cost one map and one unmap system
+  call per 64 KiB page, and those calls get 50 times slower when free RAM falls under about 3 GB (the title
+  and the layer commit 31-34 GB). `VICTORY_POOL_DISCARD=1` (in the launcher) prevents most of them: without
+  it a 6-minute run had 39 freezes instead of 7. Close other programs before playing on a 32 GB PC.
   `tools/docs/freeze-analysis.md`.
 - The memory hooks (`-Hooks`) can draw a few small textures with old contents until their own check catches it
   (7 in a 6-minute run). Off by default until fixed.
-- Heavy scenes sit at 16-21 fps: the layer's submitting thread is the limit (it walks about 55,000 pages a frame to
-  find about 2,000 changed ones; `VICTORY_REFRESH_STALE` is the fix in progress, verify mode only so far).
+- Heavy scenes sit at 16-21 fps, and driving in the open world drops lower (50-90 ms a frame at 9-12 thousand
+  draws): there the title's five recording threads are the limit, each bind costing about 22 us in the layer.
+  On lighter scenes the layer's submitting thread is the limit (`VICTORY_REFRESH_STALE=1` is verified exact but
+  gains no time yet).
 - Meshes can stretch for a second or two in busy scenes (cause not found).
 - Ray tracing (`-RayTracing`) is off by default: sharper and better lit, but the card then needs about 84 ms a
   frame (`tools/docs/rt-parked-T.md`).
 - Texture pop-in remains, less than before; the card reaches 14-15 GB of 16 in long sessions.
-- A first run on an empty shader cache can show missing or black faces.
+- Started without the launcher (or with `-NoPrecompile`) on an empty shader cache, a first run can show missing
+  or black faces; the launcher's prepare-ahead step avoids that.
 - In Series X mode the title always renders at 2560x1440 and upscales to 3840x2160 itself.
 - Two pipeline creation methods are not implemented (the title falls back to ordinary containers).
 - Fixed since the last state: a crash (a use after free in a meter thread that runs with the hooks).

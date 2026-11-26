@@ -4166,10 +4166,26 @@ impl Shadow {
                     return copied;
                 }
             }
+            // (Coder W, `VICTORY_REFRESH_STALE=1`) A range the journal alone answers: only its stale
+            // pages are looked at (one refresh in 64 goes today's way, its pages checked).
+            if crate::watch::stalelog::mode() == 1 {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % 64 != 0
+                    && let Some(now) = crate::watch::journal_answer(from, to)
+                {
+                    let began = std::time::Instant::now();
+                    let copied = self.take_stale(from, to, now);
+                    crate::copystep::rsplit(crate::copystep::R_FAST, began, 0);
+                    self.refresh_check(from, to);
+                    return copied;
+                }
+            }
             let asking = filter.then(std::time::Instant::now);
             // (Coder W, `VICTORY_REFRESH_ACCOUNT=1`) Per copy: time, bytes taken, why pages were taken again.
             let accounted = crate::copystep::account_on().then(std::time::Instant::now);
+            let asked_at = std::time::Instant::now();
             let answer = crate::watch::writes(from, to, true);
+            crate::copystep::rsplit(crate::copystep::R_OLD_ASK, asked_at, 0);
             if let Some(asking) = asking {
                 crate::knownwrites::count(crate::knownwrites::F_BASE_ASKS, 1);
                 crate::knownwrites::count(crate::knownwrites::F_BASE_NS, asking.elapsed().as_nanos() as u64);
@@ -4178,7 +4194,9 @@ impl Shadow {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
+                let walked_at = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                crate::copystep::rsplit(crate::copystep::R_OLD_WALK, walked_at, 0);
                 self.refresh_check(from, to);
                 if let Some(at) = accounted {
                     crate::copystep::refreshed(self.start, self.len, (to - from) as u64, copied as u64, at.elapsed().as_nanos() as u64);
@@ -4482,7 +4500,7 @@ impl Shadow {
         let runs = by_parts(runs, &again_at, &parts);
         // (Coder W, `VICTORY_REFRESH_STALE=verify`) Today's pages against the stale set's, then
         // the stale pages wholly in the range are current.
-        if crate::watch::stalelog::mode() == 2 {
+        if crate::watch::stalelog::mode() != 0 {
             // Everything noted up to now, this refresh's own asking's finds too; what came after
             // its answer (`now`) stays stale.
             let later = self.stale_pull(now);
@@ -4515,7 +4533,9 @@ impl Shadow {
                 }
             }
         }
+        let took = std::time::Instant::now();
         let bytes = self.take_all(runs);
+        crate::copystep::rsplit(crate::copystep::R_OLD_TAKE, took, bytes);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -4708,6 +4728,63 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// (Coder W, `VICTORY_REFRESH_STALE=1`) [`Shadow::copy_stale`] of a range the journal alone
+    /// answers at asking `now`, over its stale pages only: a page not stale has no note since the
+    /// copy last took it (`=verify` showed today's look takes none of them).
+    fn take_stale(&self, from: usize, to: usize, now: u64) -> usize {
+        crate::chunks::refreshed(from, to);
+        let later = self.stale_pull(now);
+        let pages = self.stale_pages(from, to);
+        let written = crate::watch::last_written(&pages);
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut runs, mut again_at): (Vec<(usize, usize, bool)>, Vec<(usize, u64)>) = (Vec::new(), Vec::new());
+        for (&page, &write) in pages.iter().zip(&written) {
+            let Some(at) = copied.get_mut(page - base) else {
+                continue;
+            };
+            let taken = (*at).max(ranged);
+            if taken != 0 && write <= taken {
+                continue;
+            }
+            let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if a >= b {
+                continue;
+            }
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                *at = now;
+            }
+            let known = taken != 0;
+            if known {
+                again_at.push((page, taken));
+            }
+            match runs.last_mut() {
+                Some(last) if last.1 == a && last.2 == known => last.1 = b,
+                _ => runs.push((a, b, known)),
+            }
+        }
+        let parts = crate::watch::parts_written(&again_at);
+        let runs = by_parts(runs, &again_at, &parts);
+        #[cfg(feature = "diagnostics")]
+        crate::copystep::stale_walked(to.div_ceil(PAGE) - from / PAGE, pages.len(), runs.iter().map(|r| (r.1 - r.0).div_ceil(PAGE)).sum());
+        let took = std::time::Instant::now();
+        let bytes = self.take_all(runs);
+        crate::copystep::rsplit(crate::copystep::R_FAST_TAKE, took, bytes);
+        if crate::watch::light() {
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            ranged[0] = (from, to, now);
+            if to - from >= ranged[1].1 - ranged[1].0 {
+                ranged[1] = (from, to, now);
+            }
+        }
+        drop(copied);
+        self.stale_taken(from, to);
+        self.stale_mark(&later);
+        bytes
     }
 
     /// (Coder W, `VICTORY_REFRESH_STALE`) Reads the note log over the copy's span into its stale

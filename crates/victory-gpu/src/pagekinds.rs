@@ -77,6 +77,7 @@ static OUR_WRITES: std::sync::Mutex<Option<std::collections::HashMap<usize, [u32
 
 /// One of our writers wrote, or is about to write, `[at, at + len)`.
 pub(crate) fn ours(source: Ours, at: usize, len: usize) {
+    event(source as u8, at, len);
     if gpu_only_mode() != 2 || len == 0 {
         return;
     }
@@ -130,6 +131,7 @@ pub(crate) fn found_written(pages: impl Iterator<Item = usize>) {
                 }
                 None => {
                     let n = VERIFY[3].fetch_add(1, Relaxed);
+                    stale_case("verify: written with nothing of ours to explain it", at, 64 << 10, 0);
                     if n < 16 {
                         tracing::warn!(
                             at = format_args!("{at:#x}"),
@@ -588,6 +590,7 @@ pub(crate) enum Known {
 
 /// A known event on `[at, at + len)`: its untracked blocks are noted written in the journal.
 pub(crate) fn known(kind: Known, at: usize, len: usize) {
+    event(10 + kind as u8, at, len);
     if gpu_only_mode() != 1 || len == 0 {
         return;
     }
@@ -891,6 +894,7 @@ fn net_round(from: u64, seen: &mut std::collections::HashMap<u64, crate::texture
             continue;
         }
         seen.remove(&serial);
+        stale_case("safety net: a stale copy", start as usize, len as usize, resource as usize);
         let n = NET[4].fetch_add(1, Relaxed);
         if n < 32 {
             tracing::warn!(
@@ -1008,6 +1012,97 @@ fn untracked_line(frames: f64) -> String {
 }
 
 // ---- (coder K, step 5) `VICTORY_PAGE_KINDS=1`: which "both" (kind 0) pages the title's CPU side touches ----
+
+/// (Coder W) The streaming regions by the title's own variables: (CPU view from, to), (GPU view
+/// from, to); `None` until the runtime has told them.
+pub(crate) fn streaming() -> Option<((usize, usize), (usize, usize))> {
+    let (cpu, bytes, gpu, _) = region();
+    (bytes != 0).then_some(((cpu, cpu + bytes), (gpu, gpu + bytes)))
+}
+
+// ---- (Coder W) GPU_ONLY stale-case meter: the last events on each 64 KiB block of the streaming
+// regions (ours: 0-5 as `Ours`; known: 10 + `Known`), and for each block a stale case names: what
+// wrote it last, how long ago. No behaviour change. ----
+
+const EVENT_NAMES: [&str; 14] = [
+    "buffer copy at submission (CPU copy step)",
+    "mapping change",
+    "shader writes landing",
+    "our copy / dstorage",
+    "kernel read for the title",
+    "dstorage pages",
+    "?",
+    "?",
+    "?",
+    "?",
+    "known: ours (dstorage, kernel read, landing)",
+    "known: mapping change",
+    "known: level allocated (F25)",
+    "known: stale (the net)",
+];
+
+static EVENTS: std::sync::Mutex<Option<std::collections::HashMap<usize, [(u8, u64); 4]>>> = std::sync::Mutex::new(None);
+
+fn ms_now() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn event(kind: u8, at: usize, len: usize) {
+    if gpu_only_mode() == 0 || len == 0 {
+        return;
+    }
+    let Some(((c0, c1), (g0, g1))) = streaming() else { return };
+    let end = at.saturating_add(len);
+    if !(at < c1 && c0 < end || at < g1 && g0 < end) {
+        return;
+    }
+    let now = ms_now();
+    let mut ev = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let ev = ev.get_or_insert_with(Default::default);
+    if ev.len() > 1 << 20 {
+        ev.clear();
+    }
+    for b in at / BLOCK..end.div_ceil(BLOCK).min(at / BLOCK + 4096) {
+        let e = ev.entry(b).or_insert([(0, 0); 4]);
+        e.rotate_right(1);
+        e[0] = (kind, now);
+    }
+}
+
+fn stale_case(what: &str, at: usize, len: usize, texture: usize) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, Relaxed) >= 50 {
+        return;
+    }
+    let now = ms_now();
+    let ev = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut said = Vec::new();
+    for b in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK).min(at / BLOCK + 8) {
+        let list: Vec<String> = ev
+            .as_ref()
+            .and_then(|m| m.get(&b))
+            .map(|e| {
+                e.iter()
+                    .filter(|x| x.1 != 0)
+                    .map(|&(k, t)| format!("{} {} ms ago", EVENT_NAMES.get(k as usize).copied().unwrap_or("?"), now - t))
+                    .collect()
+            })
+            .unwrap_or_default();
+        said.push(format!(
+            "block {:#x}: {}",
+            b * BLOCK,
+            if list.is_empty() { "no event of ours or known since the start".to_string() } else { list.join(", ") }
+        ));
+    }
+    tracing::warn!(
+        at = format_args!("{at:#x}"),
+        bytes = len,
+        texture = format_args!("{texture:#x}"),
+        "GPU-only stale case ({what}): the last events on its blocks: {}",
+        said.join(" | ")
+    );
+}
 
 /// The runtime's region: CPU-view base, bytes, GPU-view base, the title's page table (0s until set).
 pub type Region = fn() -> (usize, usize, usize, usize);

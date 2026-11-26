@@ -97,7 +97,8 @@ fn inspect() {
                 _ => None,
             };
             eprintln!(
-                "{file}: stage {:?} wave64 {} threads {threads:?} spilled {} instructions {} s_barrier {} bvh_intersect {} global/flat loads {} buffer loads {} ds ops {} back-branches(blocks) {}",
+                "{file}: tag {:x} stage {:?} wave64 {} threads {threads:?} spilled {} instructions {} s_barrier {} bvh_intersect {} global/flat loads {} buffer loads {} ds ops {} back-branches(blocks) {}",
+                super::code_tag(&native.code),
                 native.stage,
                 native.wave64,
                 crate::spill::is_spilled(&native),

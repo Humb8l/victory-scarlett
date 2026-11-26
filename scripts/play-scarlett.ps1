@@ -12,9 +12,9 @@
 # -Data        saves (default: %LOCALAPPDATA%\victory-scarlett\data)
 # -RayTracing  the title's own ray tracing (VICTORY_BVH_BUILDER=1): better light, much slower. Off by default.
 # -AutoStart   presses through the start screens by itself, for a fresh start with no save
-# -ProbeRays   removes the violet glow on bushes, trees and palms that the base shows with ray tracing off
-#              (the title's light probes are activated and their rays resolved as misses; no ray-tracing
-#              structure is built). Costs frame time; the first start with it builds about 1,000 pipelines.
+# -NoProbeRays the base's picture with ray tracing off: bushes, trees and palms glow violet. By default the
+#              title's light probes are activated and every ray misses, as with an empty ray-tracing
+#              structure (no cost measured); the first start after a change of this re-translates shaders.
 # -Hooks       with the memory hooks: faster, but they can show a few small textures with old contents for a
 #              moment. Off by default until that is fixed.
 # -CardSteps   0, 1 or 2 (default 2): which steps that read memory still in flight are done on the card.
@@ -28,7 +28,15 @@
 #              VICTORY_FSR_DLL). The title calls that upscaler only as a Series S, so this starts in Series S mode
 #              (720p upscaled to 1080p unless -RenderScale). OptiScaler is set up in target\<Build>\opti.
 # -DlssPreset  DLSS render preset with -Dlss (default 11 = K, the transformer model; 0 = DLSS's own choice)
+# -NoPrecompile  skip the step below
+# -OnlyPrecompile  do the step below and stop, without starting the game
 # -More        other settings, last word: -More @{ VICTORY_LOG = 'warn' }
+#
+# Before the game starts, the game's shaders are translated ahead (victory.exe shaders <shaders.rpf>) whenever
+# that is needed: on the first start, after a new build of victory.exe, and after a change of a setting that
+# changes the translation (-RayTracing, -NoProbeRays). It takes a few minutes and is remembered in the cache
+# folder, so later starts go straight to the game. Without it the first session translates while playing:
+# slow, and faces can be drawn wrong for that session.
 #
 # Run it from a normal window, not as administrator.
 param(
@@ -39,6 +47,7 @@ param(
     [string]$Data = '',
     [switch]$RayTracing,
     [switch]$AutoStart,
+    [switch]$NoProbeRays,
     [switch]$ProbeRays,
     [switch]$Hooks,
     [switch]$NoHooks,
@@ -47,6 +56,8 @@ param(
     [string]$OptiScaler = '',
     [string]$Dlss = '',
     [ValidateRange(0, 15)][int]$DlssPreset = 11,
+    [switch]$NoPrecompile,
+    [switch]$OnlyPrecompile,
     [hashtable]$More = @{}
 )
 $ErrorActionPreference = 'Stop'
@@ -140,6 +151,10 @@ $set = [ordered]@{
     # waits up to 500 ms for a pipeline still being made (above) instead of being dropped after 20 ms
     VICTORY_BAKE_TEXTURES_MS = '10000'
 
+    # Picture: the material-class depth plane is current before the title's tiling pass reads it (the base
+    # gave it last frame's)
+    VICTORY_PLANE_NOW = '1'
+
     # Every NaN and infinity that image and buffer stores write is made 0 / +-65504 (=1 takes only the
     # NaN an AMD card makes; an NVIDIA card's NaN went through and drew the sun black)
     VICTORY_NAN_GUARD_STORES = '2'
@@ -161,7 +176,7 @@ if ($Dlss) {
     $console = @('--console', 'series-s')
     $mode = "Series S with DLSS (preset $DlssPreset)"
 }
-if ($ProbeRays -and -not $RayTracing) { $set.VICTORY_ACTIVATE_RAYS = '1'; $set.VICTORY_RT_RESOLVE = '1' }
+if (-not $NoProbeRays -and -not $RayTracing) { $set.VICTORY_PROBE_RAYS = '1' }
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
 if ($AutoStart) {
     $set.VICTORY_AUTO_INPUT = 'd>=15,rep(A,1,d<10),w3,d>=20,w1,rep(A,1,d>=35),w1.5,Down,w7,Down,w0.6,A,w1.5,A,w0.7,Down,w0.5,A,w0.7,Down,w0.5,A'
@@ -178,6 +193,29 @@ if ($freeGB -lt 16) {
     Get-Process | Where-Object { $_.Name -ne 'victory' } | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 5 |
         ForEach-Object { Write-Warning ("  {0}: {1:N1} GB" -f $_.Name, ($_.PrivateMemorySize64 / 1GB)) }
 }
+# Shaders translated ahead, when needed: the mark holds what the translations depend on that this script knows of
+# (the build and the settings that change the translation).
+$rpf = Join-Path $Game 'shaders.rpf'
+$mark = Join-Path $Cache 'scarlett-shaders-ahead.txt'
+$built = Get-Item -LiteralPath $Victory
+$stamp = '{0}|{1}|{2}|probe={3}|rays={4}' -f $built.Length, $built.LastWriteTimeUtc.Ticks, $Build, $set['VICTORY_PROBE_RAYS'], $set['VICTORY_BVH_BUILDER']
+$stamp += '|' + (($set.Keys | Where-Object { $_ -like 'VICTORY_NAN_*' } | Sort-Object | ForEach-Object { "$_=$($set[$_])" }) -join ',')
+$have = if (Test-Path -LiteralPath $mark) { Get-Content -LiteralPath $mark -TotalCount 1 } else { '' }
+if (-not $NoPrecompile -and $have -ne $stamp) {
+    if (Test-Path -LiteralPath $rpf -PathType Leaf) {
+        Write-Host 'Translating the game''s shaders ahead (needed once per build and setting; a few minutes)...'
+        & $Victory shaders $rpf
+        if ($LASTEXITCODE -eq 0) {
+            Set-Content -LiteralPath $mark -Value $stamp -Encoding utf8
+        } else {
+            Write-Warning 'Translating ahead failed; the shaders will be translated while playing instead.'
+        }
+    } else {
+        Write-Warning "No shaders.rpf in ${Game}: the shaders will be translated while playing."
+    }
+}
+if ($OnlyPrecompile) { exit 0 }
+
 Write-Host ("{0} mode, {1} build, ray tracing {2}, memory hooks {3}, render scale {4}" -f $mode, $Build,
     $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($Hooks -and -not $NoHooks) { 'on' } else { 'off' }),
     $(if ($RenderScale -gt 0) { $RenderScale } else { "the title's" }))

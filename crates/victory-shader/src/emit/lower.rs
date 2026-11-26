@@ -4861,6 +4861,10 @@ impl<'a> Lower<'a> {
             return Err("a float result outside a VGPR");
         };
         let x = self.as_int(f);
+        // (Fox T, `VICTORY_NAN_ORIGIN`) Where a NaN is made.
+        if let Some(k) = super::nan_origin(&self.x.native.code) {
+            self.nan_origin_count(x, guard, k, inst.machine.offset);
+        }
         self.write(inst, Reg::V(reg), x, guard);
         if guard.is_none()
             && Self::sdwa_dst(inst).is_none()
@@ -7773,9 +7777,11 @@ impl<'a> Lower<'a> {
     /// `VICTORY_NAN_GUARD_STORES=1`) only the NaNs the GPU makes and infinities.
     /// (Fox T, `VICTORY_NAN_METER=1`) Counts `f` in the program's place of the
     /// [`super::SLOT_NAN`] buffer if it is a NaN or an infinity, for lanes that
-    /// run (`guard`): dword 0 NaNs, 1 infinities of typed stores; 2, 3 of colour
-    /// exports (`export`).
-    fn nan_meter(&mut self, f: V, guard: Option<V>, export: bool) {
+    /// run (`guard`), by `class`: 0 a typed store of a value a float operation
+    /// made (dword 0 NaNs, 1 infinities); 1 a typed store of a value of integer
+    /// or unknown origin (dword 2: those bits are likely an integer's); 2 a
+    /// float colour export (dword 3).
+    fn nan_meter(&mut self, f: V, guard: Option<V>, class: u8) {
         if !super::nan_meter() || self.s.mesh.is_some() {
             return;
         }
@@ -7795,14 +7801,45 @@ impl<'a> Lower<'a> {
         let slot = self.host_word(RootType::Other(super::USER_NAN_SLOT), 0, 0);
         let last = self.s.m.i32(super::NAN_SLOTS - 1);
         let slot = self.s.m.bin(c, Bin::And, slot, last);
-        let (k16, k4, k8) = (self.s.m.i32(16), self.s.m.i32(4), self.s.m.i32(if export { 8 } else { 0 }));
+        let k16 = self.s.m.i32(16);
         let base = self.s.m.bin(c, Bin::Mul, slot, k16);
-        let base = self.s.m.bin(c, Bin::Add, base, k8);
         let zero = self.s.m.i32(0);
-        let which = self.s.m.select(c, nan, zero, k4);
-        let byte = self.s.m.bin(c, Bin::Add, base, which);
+        let byte = if class == 0 {
+            let k4 = self.s.m.i32(4);
+            let which = self.s.m.select(c, nan, zero, k4);
+            self.s.m.bin(c, Bin::Add, base, which)
+        } else {
+            let k = self.s.m.i32(if class == 1 { 8 } else { 12 });
+            self.s.m.bin(c, Bin::Add, base, k)
+        };
         let h = self.s.root_uav_handle(super::SLOT_NAN);
         let (i32t, one) = (self.s.t.i32, self.s.m.i32(1));
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, zero, byte, iu, iu, one]);
+        self.end_guarded(gate, &[]);
+    }
+
+    /// (Fox T, `VICTORY_NAN_ORIGIN`) `x` (a float's bits) counted at the
+    /// instruction's dword in program `k`'s part of the counts if it is a NaN.
+    fn nan_origin_count(&mut self, x: V, guard: Option<V>, k: u32, offset: usize) {
+        if self.s.mesh.is_some() {
+            return;
+        }
+        let c = self.cur;
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, x, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let mut nan = self.s.m.cmp(c, pred::IUGT, abs, inf_bits);
+        if let Some(g) = guard {
+            nan = self.s.m.bin(c, Bin::And, nan, g);
+        }
+        let gate = self.begin_guarded(Some(nan));
+        let c = self.cur;
+        let dword = (offset / 4) as u32 % super::NAN_ORIGIN_DWORDS;
+        let byte = (super::NAN_SLOTS * 4 + k * super::NAN_ORIGIN_DWORDS + dword) * 4;
+        let byte = self.s.m.i32(byte);
+        let h = self.s.root_uav_handle(super::SLOT_NAN);
+        let (i32t, one, zero) = (self.s.t.i32, self.s.m.i32(1), self.s.m.i32(0));
         let iu = self.s.m.undef(i32t);
         self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, zero, byte, iu, iu, one]);
         self.end_guarded(gate, &[]);
@@ -11482,10 +11519,13 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             let mut vals = Vec::new();
+            let mut origin = Vec::new();
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                // (Fox T, `VICTORY_NAN_METER`) Whether a float operation made it.
+                origin.push(*d16 || self.floats.contains_key(&v));
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
@@ -11500,8 +11540,8 @@ impl<'a> Lower<'a> {
                 });
             }
             // (Fox T, `VICTORY_NAN_METER`) What the program stores, counted.
-            for &v in &vals {
-                self.nan_meter(v, guard, false);
+            for (&v, &float) in vals.iter().zip(&origin) {
+                self.nan_meter(v, guard, if float { 0 } else { 1 });
             }
             // (`VICTORY_NAN_GUARD_STORES=1` only)
             let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
@@ -12521,7 +12561,8 @@ impl<'a> Lower<'a> {
                         args.push(x);
                     } else {
                         let f = self.as_float(x);
-                        self.nan_meter(f, guard, false);
+                        // (origin not followed here: counted as unknown)
+                        self.nan_meter(f, guard, 1);
                         args.push(self.nan_guard(f, false));
                     }
                 }
@@ -12924,7 +12965,7 @@ impl<'a> Lower<'a> {
                 _ => (".i32", x),
             };
             if target {
-                self.nan_meter(x, None, true);
+                self.nan_meter(x, None, 2);
             }
             let x = if target { self.nan_guard(x, true) } else { x };
             let sig = if primitive { id as u32 } else { self.sig_id(false, id) };

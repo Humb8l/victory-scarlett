@@ -949,6 +949,113 @@ pub(crate) fn list_alias_line(frames: f64) {
     );
 }
 
+/// (Fox T, `VICTORY_PROBE_RAYS`) Binds of programs with node tests that were
+/// told the structures are empty.
+pub(crate) static PROBE_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+/// (Fox T, diagnostics, `VICTORY_LIST_CALLS=1`) New tables against those of
+/// the frame before, all recording threads: tables, slots; tables whose
+/// descriptor records (the records' words: view index and generation) were a
+/// table's of the frame before, and their slots; tables whose views (what the
+/// records describe, whatever their index) were, and their slots; tables at
+/// the same address with as many slots.
+#[cfg(feature = "diagnostics")]
+static CROSS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct CrossFrame {
+    frame: u64,
+    records: [std::collections::HashSet<(u32, u64)>; 2],
+    views: [std::collections::HashSet<(u32, u64)>; 2],
+    places: [std::collections::HashSet<(u64, u32)>; 2],
+}
+
+#[cfg(feature = "diagnostics")]
+static CROSS_SETS: std::sync::Mutex<Option<CrossFrame>> = std::sync::Mutex::new(None);
+
+/// What a view describes, hashed (whatever record holds it).
+#[cfg(feature = "diagnostics")]
+fn view_hash(h: &mut u64, view: Option<&View>) {
+    let Some(view) = view else {
+        mix(h, 0);
+        return;
+    };
+    let words: Vec<u64> = match view {
+        View::Constant(a, s) => vec![1, *a, u64::from(*s)],
+        View::Shader(r, d) => std::iter::once(2).chain([*r as u64]).chain(d.iter().flatten().map(|&w| u64::from(w))).collect(),
+        View::Unordered(r, c, d) => std::iter::once(3).chain([*r as u64, *c as u64]).chain(d.iter().flatten().map(|&w| u64::from(w))).collect(),
+        View::Sampler(w) => std::iter::once(4).chain(w.iter().map(|&w| u64::from(w))).collect(),
+        View::ConsoleSampler(w) => std::iter::once(5).chain(w.iter().map(|&w| u64::from(w))).collect(),
+        View::Placed(u, a, b) => std::iter::once(6 + u64::from(*u)).chain(a.iter().chain(b.iter()).map(|&w| u64::from(w))).collect(),
+    };
+    words.into_iter().for_each(|w| mix(h, w));
+}
+
+/// A new table (at `table`, `n` slots, its records hashed `records`) made.
+#[cfg(feature = "diagnostics")]
+fn cross_frame_seen(table: u64, n: u32, records: u64) {
+    let mut views = 0xcbf2_9ce4_8422_2325u64;
+    for k in 0..n {
+        view_hash(&mut views, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
+    }
+    let frame = crate::frame::current();
+    let mut sets = CROSS_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    let s = sets.get_or_insert_with(CrossFrame::default);
+    if s.frame != frame {
+        s.frame = frame;
+        for set in [&mut s.records, &mut s.views] {
+            set[0] = std::mem::take(&mut set[1]);
+        }
+        s.places[0] = std::mem::take(&mut s.places[1]);
+    }
+    let n64 = u64::from(n);
+    CROSS[0].fetch_add(1, Ordering::Relaxed);
+    CROSS[1].fetch_add(n64, Ordering::Relaxed);
+    if s.records[0].contains(&(n, records)) {
+        CROSS[2].fetch_add(1, Ordering::Relaxed);
+        CROSS[3].fetch_add(n64, Ordering::Relaxed);
+    }
+    if s.views[0].contains(&(n, views)) {
+        CROSS[4].fetch_add(1, Ordering::Relaxed);
+        CROSS[5].fetch_add(n64, Ordering::Relaxed);
+    }
+    if s.places[0].contains(&(table, n)) {
+        CROSS[6].fetch_add(1, Ordering::Relaxed);
+        CROSS[7].fetch_add(n64, Ordering::Relaxed);
+    }
+    s.records[1].insert((n, records));
+    s.views[1].insert((n, views));
+    s.places[1].insert((table, n));
+}
+
+/// For the frame lines.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cross_frame_line(frames: f64) {
+    if !crate::copystep::list_meter() {
+        return;
+    }
+    let v: [u64; 8] = std::array::from_fn(|i| CROSS[i].swap(0, Ordering::Relaxed));
+    if v[0] == 0 {
+        return;
+    }
+    let f = frames.max(1.0);
+    let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+    tracing::info!(
+        "new tables against the frame before (VICTORY_LIST_CALLS) per frame: {:.0} tables, {:.0} slots; the same records as a table of the frame before          {:.0} ({:.1} %, slots {:.1} %); the same views (whatever their records) {:.0} ({:.1} %, slots {:.1} %); at the same address with as many slots {:.0} ({:.1} %)",
+        v[0] as f64 / f,
+        v[1] as f64 / f,
+        v[2] as f64 / f,
+        pct(v[2], v[0]),
+        pct(v[3], v[1]),
+        v[4] as f64 / f,
+        pct(v[4], v[0]),
+        pct(v[5], v[1]),
+        v[6] as f64 / f,
+        pct(v[6], v[0]),
+    );
+}
+
 /// FNV-1a over 64-bit words.
 fn mix(h: &mut u64, x: u64) {
     *h ^= x;
@@ -1854,6 +1961,14 @@ impl State {
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
+        }
+        // (Fox T, `VICTORY_PROBE_RAYS`) The structures are empty: never built.
+        if kind == victory_shader::emit::USER_BVH_EMPTY {
+            let empty = !crate::pipeline::builder_runs();
+            if empty {
+                PROBE_EMPTY.fetch_add(1, Ordering::Relaxed);
+            }
+            return u32::from(empty);
         }
         // (Fox T, `VICTORY_NAN_METER`) The program's place in the counts.
         if kind == victory_shader::emit::USER_NAN_SLOT {
@@ -4932,6 +5047,9 @@ impl State {
                 TableSplit::count(4);
                 if crate::copystep::list_meter() && !self.fresh_contents.insert((key.1, key.2)) {
                     TableSplit::count(7);
+                }
+                if crate::copystep::list_meter() {
+                    cross_frame_seen(table, n, key.2);
                 }
             }
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
