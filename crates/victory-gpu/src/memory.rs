@@ -304,7 +304,10 @@ pub(crate) fn ready(
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+            // (Prefault job) A shader reading memory by address: the whole
+            // copy named is declared (nothing bounds what it addresses).
+            let ctx = crate::declstat::Ctx { way: crate::declstat::BY_ADDRESS, hash: 0, view: None };
+            crate::declstat::with(ctx, || shadow.gpu_writes(list, start, len));
         }
     }
     if first_read {

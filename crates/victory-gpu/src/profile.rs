@@ -1602,6 +1602,35 @@ struct DbgHelp {
     )>,
 }
 
+/// (Hang watch) What `address` is: the functions it is in, innermost last
+/// (inlined calls included), and its source line, through the PDB beside
+/// our executable; `None` where nothing is known. The library is opened at
+/// the first call (one at a time).
+pub(crate) fn describe(address: u64) -> Option<String> {
+    struct Held(Option<DbgHelp>);
+    // SAFETY: the library's handles are used under the lock below only.
+    unsafe impl Send for Held {}
+    static HELP: std::sync::Mutex<Option<Held>> = std::sync::Mutex::new(None);
+    let mut help = HELP.lock().unwrap_or_else(|e| e.into_inner());
+    let help = help.get_or_insert_with(|| {
+        let d = DbgHelp::open();
+        if let Some(d) = &d {
+            // SAFETY: the library's own call on its process handle.
+            unsafe { (d.refresh)(d.process) };
+        }
+        Held(d)
+    });
+    let d = help.0.as_ref()?;
+    let (names, context) = d.functions(address, true);
+    if names.is_empty() {
+        return None;
+    }
+    let line = d.line(address, context).map_or_else(String::new, |(file, n)| {
+        format!(" ({}:{n})", file.rsplit(['\\', '/']).next().unwrap_or(&file))
+    });
+    Some(format!("{}{line}", names.join(" > ")))
+}
+
 /// A symbol with room for its name.
 #[repr(C)]
 struct Symbol {

@@ -145,7 +145,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, more: Mutex::default() });
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -260,6 +260,44 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// (Neptune) More handles of the same file, each with a file object of its own
+    /// ([`reopened`]), for the workers to read through at the same time.
+    more: Mutex<Vec<std::fs::File>>,
+}
+
+/// (Neptune) Whether each worker reads a file through a handle of its own
+/// (`VICTORY_DSTORAGE_OWN_HANDLES=0`: all through the one the file was opened with, as
+/// before).
+///
+/// Windows runs the reads of one file object one after the other when it was not opened for
+/// overlapped reads: in a load eight or nine workers stood in line behind one read at a
+/// time, on NVMe drives that serve many at once.
+fn own_handles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_OWN_HANDLES").is_none_or(|v| v != "0"))
+}
+
+/// Another handle of `file`, with a file object of its own (read only, as the file was
+/// opened).
+fn reopened(file: &std::fs::File) -> Option<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    // SAFETY: a live handle of ours; the new one is owned by the `File` made of it.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+    if handle as isize == -1 || handle.is_null() {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "dstorage: a file could not be opened once more; its reads go one after the other"
+            );
+        }
+        return None;
+    }
+    // SAFETY: a handle just opened that nobody else owns.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -294,7 +332,10 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+    let complete = status_result(this, index) != E_PENDING;
+    // (F10) The frame thread's polls, meter only.
+    victory_gpu::framestream::status_polled(complete);
+    complete
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -319,6 +360,19 @@ impl Drop for Queue {
 }
 
 type QueueRef = *const Instance<Queue>;
+
+/// (F10) `VICTORY_DSTORAGE_OLDEST_FIRST` (default 1; 0: as before; 2: over
+/// priority classes too): workers take the reads of the oldest batch first.
+/// The title retires its batches strictly oldest first and blocks its frame
+/// thread when 16 are outstanding, so the oldest one decides when it goes on.
+fn oldest_first() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::env::var("VICTORY_DSTORAGE_OLDEST_FIRST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1u8).min(2);
+        victory_gpu::framestream::OLDEST_FIRST_MODE.store(u32::from(mode), Ordering::Relaxed);
+        mode
+    })
+}
 
 /// Every queue's requests, run by a pool of workers.
 struct Scheduler {
@@ -370,7 +424,10 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    /// (Storage wait job) With each read: whether its page array is known
+    /// filled (it was submitted by the title's own Submit, see
+    /// [`pages_at_submit`]).
+    reads: VecDeque<(u64, Request, bool)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -388,6 +445,8 @@ struct Job {
     seq: u64,
     request: Request,
     staging: u64,
+    /// Its page array is filled ([`pages_at_submit`]).
+    ready: bool,
 }
 
 // SAFETY: as for `Lane`.
@@ -395,6 +454,61 @@ unsafe impl Send for Job {}
 
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
+/// How many storage workers run at once (soldsawn 0bba762,
+/// `VICTORY_DSTORAGE_WORKERS=<n>` sets it outright, 1..=64): the PC's
+/// PHYSICAL cores, not its logical processors (8 here, not 16). The pool
+/// reads, inflates and unpacks in parallel; SMT twins add little and
+/// crowd the submitting thread and the copies. The author on an 8c/16t
+/// PC: copying back 2.4-3.5 ms/MB with 8 against 5.7 ms/MB with 16.
+fn worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=64).contains(n))
+        {
+            return n;
+        }
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        physical_cores().unwrap_or_else(|| (logical / 2).max(2)).clamp(1, 32)
+    })
+}
+
+/// The PC's physical cores, if the system says (one `RelationProcessorCore`
+/// record per core, whatever its SMT twins).
+fn physical_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(relationship: i32, buffer: *mut u8, length: *mut u32) -> i32;
+    }
+    const RELATION_PROCESSOR_CORE: i32 = 0;
+    let mut len: u32 = 0;
+    // SAFETY: a null buffer asks for the size (the call fails, `len` filled).
+    unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the buffer is `len` bytes; the call writes at most that.
+    if unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) } == 0 {
+        return None;
+    }
+    // Records of { Relationship: u32, Size: u32, ... }. (The author read the
+    // size at offset 0, the relationship, and so always fell back to half
+    // the logical processors.)
+    let (mut at, mut cores) = (0usize, 0usize);
+    while at + 8 <= (len as usize).min(buf.len()) {
+        let size = u32::from_le_bytes(buf[at + 4..at + 8].try_into().ok()?) as usize;
+        if size < 8 || at + size > buf.len() {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -422,7 +536,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -431,7 +545,11 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            logical = std::thread::available_parallelism().map_or(0, |n| n.get()),
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS; physical cores unless set)"
+        );
     });
     Some(scheduler)
 }
@@ -508,7 +626,15 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        PAGES_READY.set(job.ready);
+        #[cfg(windows)]
+        let faults = victory_gpu::faults::scope(victory_gpu::faults::Kind::Disk);
         let result = execute(&job.request);
+        #[cfg(windows)]
+        drop(faults);
+        PAGES_READY.set(false);
+        split_add(S_ALL, started);
+        SPLIT[S_REQUESTS].fetch_add(1, Ordering::Relaxed);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -548,6 +674,10 @@ impl Lanes {
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
+                arrays_as_enqueued = STALE[0].load(Ordering::Relaxed),
+                arrays_filled_late = STALE[1].load(Ordering::Relaxed),
+                arrays_waited_ms = STALE[2].load(Ordering::Relaxed) / 1000,
+                arrays_trusted = STALE[3].load(Ordering::Relaxed),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
@@ -565,14 +695,32 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
+        self.start_as(oldest_first())
+    }
+
+    /// [`Lanes::start`] with `VICTORY_DSTORAGE_OLDEST_FIRST` = `mode`: 0 the
+    /// lane of the class that has started the fewest bytes; 1 (default) the
+    /// class as before, then the lane whose next read was submitted first
+    /// (submission numbers are over all queues, a lane's reads and status
+    /// entries in order, so that read belongs to the oldest batch not yet
+    /// all started; within a batch, today's order); 2 the oldest read of
+    /// any class (priorities ignored).
+    fn start_as(&mut self, mode: u8) -> Option<Job> {
         let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
+        let class = if mode >= 2 {
+            busy().filter_map(|(_, l)| Some((l.reads.front()?.0, l.class))).min()?.1
+        } else {
+            busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?.1
+        };
         let (_, _, id) = busy()
             .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .filter_map(|(&id, l)| {
+                let seq = l.reads.front()?.0;
+                Some(if mode >= 1 { (seq, l.clock, id) } else { (l.clock, seq, id) })
+            })
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let &(seq, request, ready) = lane.reads.front()?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
@@ -592,6 +740,7 @@ impl Lanes {
             seq,
             request,
             staging,
+            ready,
         })
     }
 
@@ -606,8 +755,15 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers.
+    /// Moves a queue's enqueued commands to the workers: the title's own
+    /// Submit, after which every page array of them is filled.
     fn submit(&mut self, id: u64) {
+        self.submit_as(id, usize::MAX, true);
+    }
+
+    /// (Storage wait job) The first `upto` enqueued commands to the workers,
+    /// their page arrays known filled (`ready`) or not.
+    fn submit_as(&mut self, id: u64, upto: usize, ready: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -626,11 +782,20 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        let upto = upto.min(lane.unsubmitted.len());
+        let rest = lane.unsubmitted.split_off(upto);
+        for command in std::mem::replace(&mut lane.unsubmitted, rest) {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    if !ready && pages_at_submit() && request.options & PAGE_DESTINATION != 0 {
+                        // Noted now, as at enqueue before: the title has not
+                        // reached its mapping step for them yet.
+                        as_enqueued(&request);
+                    }
+                    lane.reads.push_back((seq, request, ready));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -675,6 +840,8 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            // (F10) Its batch complete, meter only.
+            victory_gpu::framestream::status_written(status.array as usize, status.index);
         }
     }
 }
@@ -704,6 +871,9 @@ fn close_lane(id: u64) {
     lane.closed = true;
     lane.unsubmitted.clear();
     lane.reads.clear();
+    for (_, s) in &lane.statuses {
+        victory_gpu::framestream::status_dropped(s.array as usize, s.index);
+    }
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
@@ -780,6 +950,10 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
+    victory_gpu::framestream::other_call();
+    if !pages_at_submit() {
+        as_enqueued(&request);
+    }
     queue(this, Command::Read(request));
 }
 
@@ -794,7 +968,11 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     };
     entry.store(E_PENDING, Ordering::Release);
     add_ref_instance(array);
+    victory_gpu::framestream::other_call();
+    victory_gpu::framestream::status_enqueued(array as usize, index);
     queue(this, Command::Status(Status { array, index }));
+    // The title's batch submit enqueues its status after its mapping step.
+    title_moved();
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
@@ -806,6 +984,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     let mut lanes = scheduler.lock();
+    let mut blocked: Option<std::time::Instant> = None;
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
             return; // closed: dropped (a status releases its array)
@@ -814,22 +993,57 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // (Storage wait job) Full with commands held back for the title's
+        // Submit: they go now (their page arrays checked as before), or the
+        // title would wait here for reads that never start.
+        if !lane.unsubmitted.is_empty() {
+            ARRAYS[A_FULL].fetch_add(1, Ordering::Relaxed);
+            lanes.submit_as(id, usize::MAX, false);
+            scheduler.work.notify_all();
+            continue;
+        }
+        // (F10) How long the frame thread waits here, meter only.
+        blocked.get_or_insert_with(std::time::Instant::now);
         lanes = scheduler
             .finished
             .wait(lanes)
             .unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(since) = blocked {
+        victory_gpu::framestream::enqueue_blocked(since.elapsed().as_nanos() as u64);
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
-        scheduler.work.notify_all();
+        if pages_at_submit() {
+            // (Storage wait job) Half full: what comes before the first
+            // read into physical pages goes; that read and what follows wait
+            // for the title's Submit, which comes after its mapping step has
+            // filled their page arrays (0x1400e88f0: executor, EnqueueStatus,
+            // Submit).
+            let upto = lane
+                .unsubmitted
+                .iter()
+                .position(|c| matches!(c, Command::Read(r) if r.options & PAGE_DESTINATION != 0))
+                .unwrap_or(lane.unsubmitted.len());
+            if upto < lane.unsubmitted.len() {
+                ARRAYS[A_HELD].fetch_add(1, Ordering::Relaxed);
+            }
+            if upto > 0 {
+                lanes.submit_as(id, upto, true);
+                scheduler.work.notify_all();
+            }
+        } else {
+            lanes.submit_as(id, usize::MAX, false);
+            scheduler.work.notify_all();
+        }
     }
 }
 
 extern "system" fn submit(this: QueueRef) {
+    victory_gpu::framestream::other_call();
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -838,8 +1052,14 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id);
+    if pages_at_submit() {
+        lanes.submit(id);
+    } else {
+        lanes.submit_as(id, usize::MAX, false);
+    }
     scheduler.work.notify_all();
+    drop(lanes);
+    title_moved();
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -901,11 +1121,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let t = std::time::Instant::now();
+    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"));
+    split_add(S_SRC, t);
+    let source = source?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
+        let t = std::time::Instant::now();
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"));
+        split_add(S_INFLATE, t);
+        let n = n?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
@@ -1038,9 +1264,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    // (Neptune) Through a handle of this read's own, so that it does not wait for the
+    // other workers' reads of the same file (`VICTORY_DSTORAGE_OWN_HANDLES`).
+    let own = if own_handles() {
+        let spare = state.more.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        spare.or_else(|| reopened(&state.file))
+    } else {
+        None
+    };
+    let file = own.as_ref().unwrap_or(&state.file);
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -1054,6 +1287,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    split_add(S_READ, started);
+    if let Some(own) = own {
+        state.more.lock().unwrap_or_else(|e| e.into_inner()).push(own);
+    }
     result
 }
 
@@ -1072,43 +1309,55 @@ fn into_destination(
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
+        let t = std::time::Instant::now();
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        split_add(S_NOTES, t);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+        let t = std::time::Instant::now();
         let filled = fill(out).map(drop);
+        split_add(S_FILL, t);
+        let t = std::time::Instant::now();
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
+        split_add(S_NOTES, t);
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let (array, count) = (request.destination.cast::<usize>().cast_const(), (offset + len).div_ceil(PAGE));
+    let t = std::time::Instant::now();
+    let mut pages = page_array(array, count);
+    split_add(S_PAGES, t);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
+        touch(window.bytes());
+        let t = std::time::Instant::now();
         let filled = fill(window.bytes()).map(drop);
+        split_add(S_FILL, t);
         drop(window);
+        let t = std::time::Instant::now();
         // The title maps pages where the card reads them and has them
         // filled afterwards: the GPU side's copies of those addresses
         // learn of the bytes only from this (upstream c75fdba, fork PR
         // #571). After a decode that failed part way too: what it wrote
         // is there.
-        super::xmem::pages_written(pages, offset, len);
+        super::xmem::pages_written(&pages, offset, len);
+        split_add(S_NOTES, t);
         return filled;
     }
+    let t = std::time::Instant::now();
     let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    split_add(S_BUF, t);
+    let t = std::time::Instant::now();
+    let n = fill(&mut data);
+    split_add(S_FILL, t);
+    let n = n?;
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
@@ -1122,12 +1371,16 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
     let mut tries = 0u32;
     while !written && tries < retries {
+        let t = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        split_add(S_RETRY, t);
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        // The title may have filled the array only now.
+        pages = page_numbers(array, count);
+        written = super::xmem::write_physical(&pages, offset, &data[..n]);
     }
     if written {
         if tries > 0 {
@@ -1142,12 +1395,14 @@ fn into_destination(
             );
         }
         // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
+        let t = std::time::Instant::now();
+        super::xmem::pages_written(&pages, offset, n);
+        split_add(S_NOTES, t);
         Ok(())
     } else {
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
+            known = super::xmem::pages_known(&pages, offset, len),
             tries,
             given_up,
             on_a_retry = RETRIED[0].load(Ordering::Relaxed),
@@ -1161,10 +1416,301 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            options = format_args!("{:#x}", request.options),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
     }
+}
+
+/// The page numbers the title's array holds now.
+fn page_numbers(array: *const usize, n: usize) -> Vec<usize> {
+    // SAFETY: the title passes a page number per 64 KiB of destination and
+    // keeps the array until the request completes; it may write it from
+    // another thread meanwhile.
+    (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
+}
+
+/// (Storage wait job) `VICTORY_DSTORAGE_PAGES_AT_SUBMIT` (default 1; 0: as
+/// before). The title's page array for a request into physical pages is its
+/// own page table (`[0x1471bfb10]`, one physical page number per 64 KiB of
+/// the GPU view, handed out by 0x144ffd8c0 at enqueue), which its mapping
+/// executor (0x140f2c470, via 0x1455aa6a0) writes inside the batch submit
+/// 0x1400e88f0, BEFORE that submit calls EnqueueStatus and Submit. So at
+/// enqueue the array holds zeros or the page's last mapping, and from the
+/// title's Submit on it holds this batch's pages. Reads started by that
+/// Submit take the array as it is, with no wait and no comparison; reads
+/// held back at a half-full queue go at that Submit too; only reads that go
+/// earlier (a full queue) or find a zero still get the old checks
+/// ([`filled`]: late and stale pages), counted.
+fn pages_at_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_PAGES_AT_SUBMIT").is_none_or(|v| v != "0");
+        tracing::info!(
+            "dstorage: page arrays {} (VICTORY_DSTORAGE_PAGES_AT_SUBMIT={})",
+            if on { "are taken as they are by reads the title's Submit starts (its mapping step fills them before); reads at a half-full queue wait for that Submit; the late/stale checks only for reads that go earlier" } else { "are checked for late and stale pages on every read, as before" },
+            u8::from(on)
+        );
+        on
+    })
+}
+
+thread_local! {
+    /// The read this worker runs was started by the title's Submit.
+    static PAGES_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// (Storage wait job) Per second: reads whose page array was taken at once;
+/// reads that waited for theirs (and the ns waited, the most); reads that went
+/// through the old checks as a fallback; of the ready ones, those that still
+/// found a zero; half-full queues that held reads back; full queues that let
+/// them go early.
+static ARRAYS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const A_READY: usize = 0;
+const A_WAITED: usize = 1;
+const A_WAIT_NS: usize = 2;
+const A_WAIT_MAX: usize = 3;
+const A_FALLBACK: usize = 4;
+const A_ZERO: usize = 5;
+const A_HELD: usize = 6;
+const A_FULL: usize = 7;
+
+/// A page array's numbers as the read runs: at once when it is known filled.
+fn page_array(array: *const usize, n: usize) -> Vec<usize> {
+    if pages_at_submit() {
+        if PAGES_READY.get() {
+            let pages = page_numbers(array, n);
+            if !pages.contains(&0) {
+                ARRAYS[A_READY].fetch_add(1, Ordering::Relaxed);
+                return pages;
+            }
+            ARRAYS[A_ZERO].fetch_add(1, Ordering::Relaxed);
+        } else {
+            ARRAYS[A_FALLBACK].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    filled(array, n)
+}
+
+/// Counts a wait for a page array that began at `began`.
+fn note_wait(began: std::time::Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
+    ARRAYS[A_WAITED].fetch_add(1, Ordering::Relaxed);
+    ARRAYS[A_WAIT_NS].fetch_add(ns, Ordering::Relaxed);
+    ARRAYS[A_WAIT_MAX].fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Bumped by the title's Submit and EnqueueStatus, which follow its mapping
+/// step: a read waiting for its page array is woken by them.
+static TITLE_MOVED: Mutex<u64> = Mutex::new(0);
+static TITLE_MOVED_CV: Condvar = Condvar::new();
+
+fn title_moved() {
+    *TITLE_MOVED.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    TITLE_MOVED_CV.notify_all();
+}
+
+/// Waits for the next [`title_moved`], `most` at most.
+fn wait_for_title(most: std::time::Duration) {
+    if most.is_zero() {
+        return;
+    }
+    let moved = TITLE_MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = *moved;
+    let _ = TITLE_MOVED_CV.wait_timeout_while(moved, most, |m| *m == now);
+}
+
+/// The page numbers of a destination. The title fills the array after it
+/// enqueued the request (a copy taken then holds zeros, or the numbers of
+/// the array's last use), so it is read when the request runs; a number
+/// that is still zero then is waited for, a tenth of a second at most
+/// (myokex c3723f3). `VICTORY_DSTORAGE_LATE_PAGES=0`: not waited for, as
+/// before.
+///
+/// (Neptune, `VICTORY_DSTORAGE_STALE_MS`) And an array that still holds, when the request
+/// runs, the numbers it held at enqueue, which are those of its last run ([`stale_pages`]).
+fn filled(array: *const usize, n: usize) -> Vec<usize> {
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    let mut pages = page_numbers(array, n);
+    stale_pages(array, n, &mut pages);
+    if !pages.contains(&0) || !late_pages() {
+        last_run(array, &pages);
+        return pages;
+    }
+    let began = std::time::Instant::now();
+    let most = std::time::Duration::from_millis(100);
+    while pages.contains(&0) && began.elapsed() < most {
+        // Woken by the title's next Submit / EnqueueStatus (its mapping
+        // step fills the arrays just before), 100 ms at most.
+        wait_for_title(most.saturating_sub(began.elapsed()));
+        pages = page_numbers(array, n);
+    }
+    note_wait(began);
+    let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+    if late <= 8 || late.is_power_of_two() {
+        tracing::warn!(
+            requests = late,
+            pages = n,
+            waited_ms = began.elapsed().as_millis() as u64,
+            filled = !pages.contains(&0),
+            "dstorage: a request ran before its page array was filled"
+        );
+    }
+    last_run(array, &pages);
+    pages
+}
+
+/// (Neptune) What the page arrays of the requests not yet run held when they were enqueued,
+/// by the array's address, in the order of the requests ([`as_enqueued`]).
+static ENQUEUED: Mutex<Option<HashMap<usize, VecDeque<Vec<usize>>>>> = Mutex::new(None);
+
+/// (Neptune) What each page array held when a request last ran with it, by the array's
+/// address: an array that holds that still at the next request's enqueue has not been
+/// touched since, and only such a one is waited for ([`stale_pages`]). An array the title
+/// filled before it enqueued holds other numbers than its last use's and is taken at once.
+static LAST_RUN: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
+
+/// (Neptune) By array: how many requests in a row ran with the pages of the one before after
+/// the whole wait had passed and the array stood unchanged. From [`SAME_TRUSTED`] on the
+/// array is one the title reads into the same pages with every time (its buffers for what it
+/// streams: half of all requests in a Neptune run, a third of the workers' time spent
+/// waiting on them), and is not waited for any more. A request with other pages starts the
+/// count again.
+static SAME_RUNS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+const SAME_TRUSTED: u32 = 3;
+
+/// (Neptune) Since the start: requests whose page array still held, when they ran, the
+/// numbers it had at enqueue (its last use's); of them, those whose array changed while the
+/// request waited for it; the microseconds waited in all; and requests not waited for
+/// because their array is trusted ([`SAME_RUNS`]).
+static STALE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn same_runs(array: usize, set: Option<u32>) -> u32 {
+    let mut all = SAME_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let runs = all.get_or_insert_with(HashMap::new).entry(array).or_insert(0);
+    match set {
+        Some(0) => *runs = 0,
+        Some(_) => *runs = runs.saturating_add(1),
+        None => {}
+    }
+    *runs
+}
+
+/// (Neptune) Notes what the page array of `request` holds as it is enqueued.
+///
+/// The title fills the array after it has enqueued the request. Until it has, the array
+/// holds zeros, which [`filled`] waits for, or the numbers of its last use, which nothing
+/// told apart from this request's own: the request then wrote its bytes into the pages of
+/// the texture or model read there before, and the pages it was meant for kept what they
+/// held (a texture of coloured noise on one character's arms, another's face).
+/// `VICTORY_DSTORAGE_STALE_MS=0`: not noted, as before.
+fn as_enqueued(request: &Request) {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() || stale_wait().is_zero() {
+        return;
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let n = (offset + request.destination_size as usize).div_ceil(PAGE);
+    let now = page_numbers(request.destination.cast::<usize>().cast_const(), n);
+    let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    all.get_or_insert_with(HashMap::new).entry(request.destination as usize).or_default().push_back(now);
+}
+
+/// How long a request waits for a page array that still holds what it held at enqueue
+/// (`VICTORY_DSTORAGE_STALE_MS`, 10; 0: not waited for, as before).
+fn stale_wait() -> std::time::Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        // 10 (Neptune): of the 127 arrays found stale in their runs, 109 were filled within
+        // 2 ms, 7 more within 4 and the last 11 within 6.
+        let ms = std::env::var("VICTORY_DSTORAGE_STALE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10);
+        tracing::info!(
+            "dstorage: a page array that still holds its last request's pages when the next runs is waited for {ms} ms at most (VICTORY_DSTORAGE_STALE_MS={ms}; trusted after {SAME_TRUSTED} runs in a row with the same pages)"
+        );
+        ms
+    }))
+}
+
+/// (Neptune) For [`filled`]: `pages`, read from `array` as the request runs, are what the
+/// array held at enqueue and at its last run, and not zeros: the title has not filled it
+/// for this request yet (or asks for the same pages again, which a short wait does not
+/// harm). Waited for [`stale_wait`] at most, unless the array is trusted
+/// ([`SAME_TRUSTED`]); `pages` is read again meanwhile.
+fn stale_pages(array: *const usize, n: usize, pages: &mut Vec<usize>) {
+    if stale_wait().is_zero() {
+        return;
+    }
+    let before = {
+        let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
+        all.as_mut().and_then(|all| {
+            let line = all.get_mut(&(array as usize))?;
+            let before = line.pop_front();
+            if line.is_empty() {
+                all.remove(&(array as usize));
+            }
+            before
+        })
+    };
+    let untouched = {
+        let last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        last.as_ref()
+            .and_then(|last| last.get(&(array as usize)))
+            .is_some_and(|last| last.len() >= n && last[..n] == pages[..])
+    };
+    if !untouched {
+        same_runs(array as usize, Some(0));
+    }
+    let Some(before) = before else {
+        return;
+    };
+    if !untouched || !before.iter().any(|&p| p != 0) || pages.contains(&0) || before.len() < n || before[..n] != pages[..] {
+        return;
+    }
+    if same_runs(array as usize, None) >= SAME_TRUSTED {
+        STALE[3].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    STALE[0].fetch_add(1, Ordering::Relaxed);
+    let began = std::time::Instant::now();
+    let most = stale_wait();
+    while before[..n] == pages[..] && began.elapsed() < most {
+        // Event-driven as in [`filled`].
+        wait_for_title(most.saturating_sub(began.elapsed()));
+        *pages = page_numbers(array, n);
+    }
+    note_wait(began);
+    STALE[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if before[..n] != pages[..] {
+        STALE[1].fetch_add(1, Ordering::Relaxed);
+        same_runs(array as usize, Some(0));
+    } else {
+        same_runs(array as usize, Some(1));
+    }
+}
+
+/// (Neptune) What `array` held as its request ran, for the next request's [`stale_pages`].
+fn last_run(array: *const usize, pages: &[usize]) {
+    if stale_wait().is_zero() {
+        return;
+    }
+    let mut last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+    last.get_or_insert_with(HashMap::new).insert(array as usize, pages.to_vec());
+}
+
+/// Whether [`filled`] waits for page numbers the title writes after the
+/// request (`VICTORY_DSTORAGE_LATE_PAGES`, on unless `0`).
+fn late_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_LATE_PAGES").is_none_or(|v| v != "0");
+        tracing::info!(
+            "dstorage: page arrays filled after the request {} (VICTORY_DSTORAGE_LATE_PAGES={})",
+            if on { "are waited for, 100 ms at most" } else { "are not waited for" },
+            if on { "1, the default" } else { "0" }
+        );
+        on
+    })
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1184,7 +1730,125 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<11> as *const (),   // 0x58 (2020: queue info)
 ]);
 
+/// (Run-46) The workers' time since the last line, ns: requests run in all,
+/// reading files, inflating to the intermediate (zlib before BCPack),
+/// waiting for the page array (late or stale), first touch of the
+/// destination's pages (their soft faults), filling the destination
+/// (decode or copy), telling the GPU side (`kernel_will_write`,
+/// `title_memory_written`, `pages_written`); and requests.
+static SPLIT: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const S_ALL: usize = 0;
+const S_READ: usize = 1;
+const S_INFLATE: usize = 2;
+const S_PAGES: usize = 3;
+const S_TOUCH: usize = 4;
+const S_FILL: usize = 5;
+const S_NOTES: usize = 6;
+const S_REQUESTS: usize = 7;
+/// (Storage wait job) Compressed requests' source reads (outside the fill),
+/// buffers made for scattered destinations, and retry sleeps: what "other"
+/// held before.
+const S_SRC: usize = 8;
+const S_BUF: usize = 9;
+const S_RETRY: usize = 10;
+
+fn split_add(what: usize, since: std::time::Instant) {
+    SPLIT[what].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The process's page faults (all kinds) so far.
+#[cfg(windows)]
+fn page_faults() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    u64::from(c.PageFaultCount)
+}
+
+/// The workers' split for the "frame thread streaming" line.
+fn split_line() -> String {
+    let c: Vec<u64> = SPLIT.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    #[cfg(windows)]
+    let (lock, view, unmap, lookup, copy, note_lookup) = {
+        use super::xmem::{W_COPY, W_LOCK, W_LOOKUP, W_NOTE_LOOKUP, W_UNMAP, W_VIEW, WORKER_NS};
+        let t = |i: usize| WORKER_NS[i].swap(0, Ordering::Relaxed);
+        (t(W_LOCK), t(W_VIEW), t(W_UNMAP), t(W_LOOKUP), t(W_COPY), t(W_NOTE_LOOKUP))
+    };
+    #[cfg(not(windows))]
+    let (lock, view, unmap, lookup, copy, note_lookup) = (0, 0, 0, 0, 0, 0);
+    #[cfg(windows)]
+    let faults = {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = page_faults();
+        now.saturating_sub(LAST.swap(now, Ordering::Relaxed))
+    };
+    #[cfg(not(windows))]
+    let faults = 0;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let named = c[S_INFLATE]
+        + c[S_PAGES]
+        + c[S_TOUCH]
+        + c[S_FILL]
+        + c[S_NOTES]
+        + c[S_SRC]
+        + c[S_BUF]
+        + c[S_RETRY]
+        + lock
+        + view
+        + unmap
+        + lookup
+        + copy;
+    let a: Vec<u64> = ARRAYS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    let mean = if a[A_WAITED] == 0 { 0.0 } else { ms(a[A_WAIT_NS]) / a[A_WAITED] as f64 };
+    format!(
+        "; dstorage workers {} requests {:.1} ms: file read {:.1}, inflate to intermediate {:.1}, page-array wait {:.1}, page-table lock wait {:.1}, own view map+commit {:.1}, first touch (soft faults) {:.1}, fill (decode/copy; raw reads: their file read too) {:.1}, own view unmap {:.1}, notes to the GPU side {:.1} (of which page-table lookup {:.1}), compressed source read {:.1}, page lookup {:.1}, scattered-page buffer {:.1} + copy {:.1}, write retries {:.1}, other {:.1} ms (VICTORY_DSTORAGE_LINEAR_VIEW); page arrays (VICTORY_DSTORAGE_PAGES_AT_SUBMIT={}): ready at start {}, waited {} (mean {mean:.2} ms, max {:.2} ms), fallback stale checks {}, zero after submit {}, held at a half-full queue {}, let go by a full queue {}; process page faults {faults}",
+        c[S_REQUESTS],
+        ms(c[S_ALL]),
+        ms(c[S_READ]),
+        ms(c[S_INFLATE]),
+        ms(c[S_PAGES]),
+        ms(lock),
+        ms(view),
+        ms(c[S_TOUCH]),
+        ms(c[S_FILL]),
+        ms(unmap),
+        ms(c[S_NOTES]),
+        ms(note_lookup),
+        ms(c[S_SRC]),
+        ms(lookup),
+        ms(c[S_BUF]),
+        ms(copy),
+        ms(c[S_RETRY]),
+        ms(c[S_ALL].saturating_sub(named)),
+        u8::from(pages_at_submit()),
+        a[A_READY],
+        a[A_WAITED],
+        ms(a[A_WAIT_MAX]),
+        a[A_FALLBACK],
+        a[A_ZERO],
+        a[A_HELD],
+        a[A_FULL],
+    )
+}
+
+/// Reads one byte of each 4 KiB page of `bytes`: their first-touch faults
+/// taken (and timed) apart from the decode.
+fn touch(bytes: &mut [u8]) {
+    let t = std::time::Instant::now();
+    for k in (0..bytes.len()).step_by(4096) {
+        // SAFETY: inside the slice.
+        unsafe { std::ptr::read_volatile(bytes.as_ptr().add(k)) };
+    }
+    split_add(S_TOUCH, t);
+}
+
 pub(crate) fn module() -> HleModule {
+    victory_gpu::framestream::add_to_line(split_line);
+    // (Storage wait job) Page faults by the layer's kinds of work, per second.
+    #[cfg(windows)]
+    victory_gpu::framestream::add_to_line(victory_gpu::faults::second_line);
     HleModule {
         name: "dstorage",
         dlls: &["xcrdapi.dll"],
@@ -1318,6 +1982,57 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_page_array_filled_late_is_waited_for() {
+        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
+        let title = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            array[1].store(8, Ordering::Release);
+        });
+        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
+        title.join().unwrap();
+        // One never filled is given up on.
+        array[0].store(0, Ordering::Release);
+        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
+    }
+
+    /// (Neptune, `VICTORY_DSTORAGE_STALE_MS`) An array that holds its last run's pages at
+    /// enqueue and still when the request runs is waited for until the title fills it; one
+    /// that ran with the same pages after the whole wait three times in a row is trusted.
+    #[test]
+    fn a_page_array_still_holding_its_last_pages_is_waited_for() {
+        let array: &'static [std::sync::atomic::AtomicUsize] =
+            Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(5), std::sync::atomic::AtomicUsize::new(6)]));
+        let at = array.as_ptr().cast::<usize>();
+        let enqueue = || {
+            let mut all = ENQUEUED.lock().unwrap();
+            all.get_or_insert_with(HashMap::new).entry(at as usize).or_default().push_back(page_numbers(at, 2));
+        };
+        // A first run: nothing to compare with.
+        enqueue();
+        assert_eq!(filled(at, 2), [5, 6]);
+        // Enqueued with the old pages, filled by the title a moment later.
+        enqueue();
+        let title = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            array[0].store(9, Ordering::Release);
+            array[1].store(10, Ordering::Release);
+        });
+        assert_eq!(filled(at, 2), [9, 10]);
+        title.join().unwrap();
+        // The same pages every time: waited for in full three times, then trusted.
+        let trusted = STALE[3].load(Ordering::Relaxed);
+        for _ in 0..SAME_TRUSTED {
+            enqueue();
+            assert_eq!(filled(at, 2), [9, 10]);
+        }
+        let began = std::time::Instant::now();
+        enqueue();
+        assert_eq!(filled(at, 2), [9, 10]);
+        assert!(began.elapsed() < stale_wait());
+        assert_eq!(STALE[3].load(Ordering::Relaxed), trusted + 1);
     }
 
     #[test]
@@ -1486,7 +2201,9 @@ mod tests {
         (0..3).for_each(|id| l.submit(id));
         let mut started = [0u32; 3];
         for _ in 0..330 {
-            let job = l.start().unwrap();
+            // (As before `VICTORY_DSTORAGE_OLDEST_FIRST`: round robin by bytes
+            // among the lanes of a class.)
+            let job = l.start_as(0).unwrap();
             started[job.lane as usize] += 1;
             l.finish(&job, Ok(()));
         }
@@ -1494,6 +2211,58 @@ mod tests {
         assert_eq!(started[1] + started[2], 300, "{started:?}");
         assert_eq!(started[0], 30, "{started:?}");
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+    }
+
+    /// (F10, `VICTORY_DSTORAGE_OLDEST_FIRST`) The reads of the oldest batch
+    /// go first, whichever lane holds it and however many bytes each lane
+    /// has started; within a batch in its order; classes still share by
+    /// bytes (mode 1), or not (mode 2).
+    #[test]
+    fn the_oldest_batch_is_read_first() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 4096));
+        l.lanes.insert(1, Lane::new(0, 4096));
+        // Batch 1 on lane 1 (big reads), batch 2 on lane 0, batch 3 on lane 1.
+        for _ in 0..3 {
+            read(&mut l, 1, 0, 1 << 20);
+        }
+        l.submit(1);
+        for _ in 0..3 {
+            read(&mut l, 0, 0, 4096);
+        }
+        l.submit(0);
+        for _ in 0..3 {
+            read(&mut l, 1, 0, 4096);
+        }
+        l.submit(1);
+        let mut order = Vec::new();
+        while let Some(job) = l.start_as(1) {
+            order.push((job.lane, job.seq));
+            l.finish(&job, Ok(()));
+        }
+        assert_eq!(order.iter().map(|o| o.1).collect::<Vec<_>>(), (0..9).collect::<Vec<_>>(), "{order:?}");
+        assert_eq!(order.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 1, 1, 0, 0, 0, 1, 1, 1]);
+        // Before: lane 0 had started fewer bytes and went ahead of batch 1.
+        let mut l2 = lanes(STAGING);
+        l2.lanes.insert(0, Lane::new(0, 4096));
+        l2.lanes.insert(1, Lane::new(0, 4096));
+        read(&mut l2, 1, 0, 1 << 20);
+        read(&mut l2, 1, 0, 1 << 20);
+        l2.submit(1);
+        read(&mut l2, 0, 0, 4096);
+        l2.submit(0);
+        let first = l2.start_as(0).unwrap();
+        l2.finish(&first, Ok(()));
+        assert_eq!(l2.start_as(0).unwrap().lane, 0, "round robin by bytes");
+        // Mode 2: over classes too.
+        let mut l3 = lanes(STAGING);
+        l3.lanes.insert(0, Lane::new(-1, 4096));
+        l3.lanes.insert(1, Lane::new(1, 4096));
+        read(&mut l3, 0, 0, 4096);
+        l3.submit(0);
+        read(&mut l3, 1, 0, 4096);
+        l3.submit(1);
+        assert_eq!(l3.start_as(2).unwrap().lane, 0, "the low-priority batch is older");
     }
 
     #[test]

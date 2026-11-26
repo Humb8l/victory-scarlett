@@ -290,11 +290,30 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    // A view of our own made on an earlier section that had this handle's
+    // number shows that section's pages, not this one's: it is forgotten
+    // (left mapped: nothing reads it any more) and the next store through
+    // a view of ours maps this section (myokex 3973179).
+    // `VICTORY_OWN_VIEW_FORGET=0`: kept, as before.
+    static FORGET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*FORGET.get_or_init(|| std::env::var_os("VICTORY_OWN_VIEW_FORGET").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
+    if gone.is_some() {
+        tracing::info!(
+            section,
+            "a section handle's number came round again: our own view of the earlier section is forgotten (VICTORY_OWN_VIEW_FORGET=0: kept)"
+        );
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    #[cfg(windows)]
+    crate::resource::note_mapped(len as u64);
     {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
@@ -315,7 +334,11 @@ pub(crate) fn view_census(at: usize, len: usize) -> (usize, usize) {
     let v = views();
     let end = at.saturating_add(len);
     let (mut in_views, mut multi) = (0, 0);
-    for (&base, &(vlen, section, offset)) in v.views.range(..end) {
+    // (F3) The view holding `at` and those starting inside (views do not
+    // overlap), not every view below `end`: the census held this lock, which
+    // every mapping call takes, over a walk of the whole table per copy.
+    let first = v.views.range(..=at).next_back().map_or(at, |(&base, _)| base);
+    for (&base, &(vlen, section, offset)) in v.views.range(first..end) {
         let (lo, hi) = (base.max(at), (base + vlen).min(end));
         if lo >= hi {
             continue;
@@ -358,6 +381,22 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// Whether any title view overlaps `[start, end)`: [`views_between`]
+/// without making the list (JoshuuDev 40f9ce3). The write watch asks this
+/// of every range it asks the kernel about (`crate::watch::has_views`).
+pub(crate) fn any_view_between(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let v = views();
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        return true;
+    }
+    v.views.range(start.saturating_add(1)..end).next().is_some()
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
@@ -467,13 +506,32 @@ static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex
 /// title view that shows it (the page of `at` among them), or `None` with
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
+/// The addresses of the 64 KiB page of `[at, at + n)` in every title view
+/// that shows it, as [`write_own`] finds them, nothing written; `None` if
+/// it would not write there (not view memory, more than one page, a page
+/// of very many views).
+pub(crate) fn shown_at(at: usize, n: usize) -> Option<Vec<usize>> {
+    if n == 0 || at / K64 != (at + n - 1) / K64 {
+        return None;
+    }
+    let v = views();
+    let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
+    if at + n > base + len {
+        return None;
+    }
+    let offset = offset + (at - base) as u64;
+    let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
+    (shown.len() <= crate::watch::MANY_VIEWS).then_some(shown)
+}
+
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
         return None;
     }
     // No mapping changes until the bytes are in: the view found below
-    // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    // shows these pages for as long as this is held (with
+    // `VICTORY_MAPPING_RANGES`, the whole 64 KiB page of `at`).
+    let _still = crate::watch::title_memory_reading_now(at - at % K64, K64)?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
@@ -1252,6 +1310,32 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `any_view_between` says yes exactly where `views_between` lists a
+    /// view (JoshuuDev 40f9ce3's test).
+    #[test]
+    fn any_view_agrees_with_the_list_of_views() {
+        let at = 0x7_9000_0000usize;
+        title_memory_view(at, 2 * K64, 78, 0);
+        title_memory_view(at + 4 * K64, K64, 78, 4 * K64 as u64);
+        for (start, end) in [
+            (at, at + K64),
+            (at + K64, at + 3 * K64),
+            (at + 2 * K64, at + 4 * K64),
+            (at + 2 * K64, at + 5 * K64),
+            (at + 3 * K64, at + 4 * K64 + 1),
+            (at + 5 * K64, at + 8 * K64),
+            (at - K64, at),
+            (at - K64, at + 1),
+            (at + K64, at + K64),
+        ] {
+            assert_eq!(any_view_between(start, end), !views_between(start, end).is_empty(), "{start:#x}..{end:#x}");
+        }
+        assert!(!any_view_between(at + 2 * K64, at + 4 * K64));
+        assert!(any_view_between(at + K64, at + K64 + 1));
+        views_gone(at, 8 * K64);
+        assert!(!any_view_between(at, at + 8 * K64));
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

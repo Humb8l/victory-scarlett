@@ -127,6 +127,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// (P3, `crate::timeline`) This recording's first list call and its
+    /// close (ns; 0: none since the reset), taken when it is submitted.
+    #[cfg(windows)]
+    stamps: [std::sync::atomic::AtomicU64; 2],
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -144,6 +148,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    let _call = timed(this);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -153,6 +158,31 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
     crate::profile::seen(crate::profile::Seen::Record);
+}
+
+/// (P3) A list call of the title's on `this`, timed for the title timeline
+/// while the guard lives (`crate::timeline::Call`).
+#[cfg(windows)]
+fn timed(this: This) -> crate::timeline::Call {
+    static NONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    if this.is_null() {
+        return crate::timeline::Call::begin(&NONE);
+    }
+    // SAFETY: the title passes one of our lists.
+    crate::timeline::Call::begin(unsafe { &(*this.cast::<List>()).stamps[0] })
+}
+
+/// (P3) The submission of title list `this` is recorded: its recording's first
+/// call and close, taken (a list submitted again without a reset adds nothing).
+#[cfg(windows)]
+pub(crate) fn take_stamps(this: This) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return (0, 0);
+    }
+    // SAFETY: the title passes our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    (list.stamps[0].swap(0, Relaxed), list.stamps[1].load(Relaxed))
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -179,7 +209,13 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    let host = unsafe { (*this.cast::<List>()).host.as_ref() };
+    // (Card kinds job) A title command follows: a run of our commands
+    // timed inside the list ends before it.
+    if let Some(h) = host {
+        h.inside_end();
+    }
+    host
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
@@ -200,10 +236,42 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// (cool_fox `Detached::release_tables`) Whether a landed flight's lists give
+/// their dynamic descriptor slots back at the landing, on the thread that
+/// lands it (`VICTORY_RELEASE_AT_LANDING`, default 1; 0: when the landed
+/// lists are next recycled, at the next submission or settle, as before).
+/// The lists have run and their copy-back is done: nothing reads the slots;
+/// the list's state is its own (taken from the title's list at submission).
+/// cool_fox's fork kept them for 16-64 submissions behind its bury lag and
+/// ran the pool out; ours had no such lag (no draw dropped for want of slots
+/// in runs 95/97), so this only gives them back a little sooner.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+pub(crate) fn release_at_landing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_AT_LANDING").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: lists that gave their slots back at landing.
+#[cfg(windows)]
+pub(crate) static RELEASED_AT_LANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`release_at_landing`] for a landed flight's lists.
+#[cfg(windows)]
+pub(crate) fn release_landed(lists: &mut [Detached]) {
+    if !release_at_landing() {
+        return;
+    }
+    for d in lists {
+        d._state.tables_done();
+        RELEASED_AT_LANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put there
+/// (`crate::host::moment`, for [`let_go_idle_lists`]).
+#[cfg(windows)]
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -229,7 +297,20 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 // the frame before are still in the air, so more than 128 are out at a
 // time: 80 host lists were made and as many thrown away every frame,
 // 8 ms to make and more to free, on the thread that submits.)
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+const IDLE_MOST_USUAL: (usize, u64) = (512, 256 << 20);
+
+/// (Neptune) The most idle host lists kept and their bytes:
+/// `VICTORY_LIST_POOL_MOST` (512 here, 128 in Neptune) and
+/// `VICTORY_LIST_POOL_MB` (256); Neptune's launcher sets 2,048 and 2,048.
+#[cfg(windows)]
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let lists = std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(IDLE_MOST_USUAL.0);
+        let bytes = std::env::var("VICTORY_LIST_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(IDLE_MOST_USUAL.1, |mb| mb << 20);
+        (lists, bytes)
+    })
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -246,13 +327,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -270,7 +351,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most().0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -278,11 +359,86 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+        if idle.0.len() < idle_most().0 && idle.1 + bytes <= idle_most().1 {
+            idle.0.push(Idle(host, bytes, crate::host::moment()));
             idle.1 += bytes;
         }
     }
+}
+
+/// The seconds a host list may stay idle before it goes
+/// (`VICTORY_LIST_POOL_IDLE_S`, 10; 0 keeps them, as before).
+#[cfg(windows)]
+fn idle_list_ms() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(10, |s| s.min(3600))
+    }) * 1000
+}
+
+/// Lets go of the host lists that stayed idle for [`idle_list_ms`] and 60
+/// frames. The pool takes the newest list first, so the oldest are those
+/// a burst left (512 at most, with their command allocators: what the
+/// driver keeps for a list's commands stays with its allocator over a
+/// reset, the size of the longest recording it held). Called once a
+/// second before a submission starts; an idle list has run and was reset,
+/// so nothing in the air names it.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_lists() {
+    let ms = idle_list_ms();
+    if ms == 0 || !pools() {
+        return;
+    }
+    let went: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let old = idle
+            .0
+            .iter()
+            .take_while(|Idle(_, _, put)| crate::host::long_ago(*put, ms, 60))
+            .count();
+        let went: Vec<Idle> = idle.0.drain(..old).collect();
+        idle.1 -= went.iter().map(|Idle(_, bytes, _)| bytes).sum::<u64>();
+        went
+    };
+    if went.is_empty() {
+        return;
+    }
+    let n = went.len() as u64;
+    IDLE_LET_GO.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let before = crate::host::private_bytes();
+    drop(went);
+    #[cfg(feature = "diagnostics")]
+    {
+        // What a list's let-go gives back (its allocators' command memory
+        // is the driver's, which no counter of ours sees).
+        let after = crate::host::private_bytes();
+        let freed = before as i64 - after as i64;
+        IDLE_FREED.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+        crate::host::trail(|| {
+            format!(
+                "sweep: {n} idle host lists let go; private bytes fell {} KiB",
+                freed >> 10
+            )
+        });
+    }
+}
+
+/// Host lists let go as idle since the start ([`let_go_idle_lists`]), and
+/// (diagnostics) what the process's private bytes fell by while they were.
+#[cfg(windows)]
+pub(crate) static IDLE_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static IDLE_FREED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// For the memory line: host lists idle now and the upload bytes they keep.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_lists() -> [u64; 2] {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    [idle.0.len() as u64, idle.1]
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -596,6 +752,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        stamps: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -627,7 +785,14 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        let _call = timed(this);
         host.close();
+    }
+    // (P3) When the recording ended, for the title timeline.
+    #[cfg(windows)]
+    if crate::timeline::on() && !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        unsafe { &(*this.cast::<List>()).stamps[1] }.store(crate::timeline::now_ns(), std::sync::atomic::Ordering::Relaxed);
     }
     S_OK
 }
@@ -653,6 +818,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // (P3) A new recording: no first call, no close yet.
+        for s in &list.stamps {
+            s.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -746,11 +915,23 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    let _call = timed(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // The CPU-written indirect arena moved to unordered access: its
+        // records are no longer read on the CPU (`crate::indirect::arena`).
+        // A transition's state after, or an unordered access barrier on it.
+        for b in barriers {
+            match b.kind {
+                0 => crate::indirect::arena::note_barrier(b.first as u64, b.last as u32),
+                2 => crate::indirect::arena::note_barrier(b.first as u64, 0x8),
+                _ => {}
+            }
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -822,9 +1003,12 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    let _call = timed(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !gpu_buffer_copy(list, to, from, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -865,6 +1049,8 @@ fn unlike(dst: This, src: This, mapped: bool) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    let _call = timed(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -929,11 +1115,114 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if !gpu_buffer_copy(list, to, from, a.min(b) as usize) {
+                list.defer_copy(to, from, a.min(b) as usize);
+            }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// Whether a title buffer copy runs on the card (`VICTORY_GPU_BUFFER_COPY`,
+/// on unless 0; Trexies e6d37be), only where the copy at submission on the
+/// CPU would read or write bytes a flight in the air may write: that copy
+/// has to wait for the flights to land (a settle), where the card runs a
+/// copy in its queue's order, behind them, as the console does. The
+/// source's host copy is brought up to date first, the destination's range
+/// is declared written by the card (it comes back into title memory with
+/// what shaders wrote, as their writes do). A later copy or constant fill
+/// of the same list touching what this one did on the card goes on the
+/// card too (`HostList::card_copied`): steps at submission run before
+/// every command of the list, so on the CPU it would run ahead of this
+/// copy. False if it could not: the caller copies on the CPU as before.
+#[cfg(windows)]
+fn gpu_buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_BUFFER_COPY").is_none_or(|v| v != "0")) {
+        crate::host::read_wait::why(crate::host::read_wait::NC_SWITCH);
+        return false;
+    }
+    use crate::host::read_wait::{NC_HOLDS, NC_NO_COPY, NC_SWITCH, NC_UNDECLARED, why};
+    let (dst, src) = (to as usize, from as usize);
+    if len == 0 || !crate::host::late() {
+        why(NC_SWITCH);
+        return false;
+    }
+    let after_card = list.card_copied(src, src + len) || list.card_copied(dst, dst + len);
+    if !(after_card || crate::host::flights_write(src, src + len) || crate::host::flights_write(dst, dst + len)) {
+        // (P1 step 2, `VICTORY_FILL_PREDICT_CARD`) Not in the air yet, but a
+        // shader is known to rewrite the source: on the card behind it.
+        let predicted = crate::host::read_wait::predict_card() && crate::host::read_wait::predicted(src, len);
+        if !predicted {
+            why(NC_UNDECLARED);
+            return false;
+        }
+        crate::framelog::add(crate::framelog::T::PredictedCard, 1);
+    }
+    let done = 'card: {
+        let (Some(d), Some(s)) = (
+            crate::shadow::find(dst as u64, len as u64),
+            crate::shadow::find(src as u64, len as u64),
+        ) else {
+            why(NC_NO_COPY);
+            break 'card false;
+        };
+        why(NC_HOLDS);
+        // Both copies must hold the whole range, one buffer may not copy
+        // over itself where the ranges overlap, and the destination is not
+        // the title's memory itself (write watching would not see the
+        // card's write there). Each copy is the one the flights' writes
+        // (and this list's card copies) went to.
+        let (Some(d_at), Some(s_at)) = (d.offset_in(dst as u64), s.offset_in(src as u64)) else {
+            break 'card false;
+        };
+        if d.left(dst as u64) < len as u64
+            || s.left(src as u64) < len as u64
+            || d.in_place()
+            || (std::sync::Arc::ptr_eq(&d, &s) && src < dst + len && dst < src + len)
+            || !list.card_holds(&s, src, src + len)
+            || !list.card_holds(&d, dst, dst + len)
+        {
+            break 'card false;
+        }
+        s.refresh(list, src as u64, len as u64);
+        d.refresh(list, dst as u64, len as u64);
+        d.gpu_writes(list, dst as u64, len as u64);
+        list.note_card_copy(&d, dst, dst + len);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("title buffer copy on the card {src:#x} -> {dst:#x} ({len} bytes)"));
+        let uav = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+            Type: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            ..Default::default()
+        };
+        // (Card kinds job) Timed with the run of our commands it is part of.
+        list.inside(crate::cardmeter::Inside::Copy);
+        crate::cardmeter::inside_barriers(crate::cardmeter::Inside::Copy, 2, 0);
+        // SAFETY: an open list; both host copies are live and hold the
+        // ranges (checked above). Shaders' writes before the copy first,
+        // then the copy's before what follows.
+        unsafe {
+            list.list.ResourceBarrier(std::slice::from_ref(&uav));
+            list.list.CopyBufferRegion(&d.buffer, d_at, &s.buffer, s_at, len as u64);
+            list.list.ResourceBarrier(std::slice::from_ref(&uav));
+        }
+        crate::host::ON_CARD[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        why(0);
+        true
+    };
+    if !done && after_card {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                src = format_args!("{src:#x}"),
+                dst = format_args!("{dst:#x}"),
+                len,
+                "a title buffer copy after one on the card in its list ran on the CPU, ahead of it (VICTORY_GPU_BUFFER_COPY)"
+            )
+        });
+    }
+    done
 }
 
 /// A whole-texture copy between host copies that leave out different
@@ -998,6 +1287,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    let _call = timed(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1072,12 +1363,22 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
+            // Bytes a shader of this list writes (a dispatch encodes
+            // texture blocks into the buffer, this copy puts them into the
+            // texture) are not in title memory yet when the upload is
+            // filled at submission: they come from the memory's host copy,
+            // on the card, after the dispatch (`VICTORY_COPY_WRITTEN_SOURCE`).
+            let buffer = if let Some(staged) = list.staged_written_source(host, data as u64, bytes) {
+                staged
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+                buffer
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -1262,6 +1563,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    let _call = timed(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1338,6 +1641,8 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    let _call = timed(this);
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1388,6 +1693,8 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    let _call = timed(this);
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -1426,6 +1733,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    let _call = timed(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1826,6 +2135,15 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    // Finding F8: the call's kind x "arguments in the shared CPU arena".
+    #[cfg(windows)]
+    let arena = crate::indirect::split::note_call(
+        args.first().map_or(u32::MAX, |a| a[0]),
+        arguments as u64,
+        crate::resource::buffer_bytes(arguments).map(|(p, len)| (p as u64, len)),
+        max,
+        !count.is_null(),
+    );
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
@@ -1834,7 +2152,7 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, arena);
         });
     } else {
         #[cfg(windows)]
@@ -1847,6 +2165,8 @@ extern "system" fn execute_indirect(
     if ran {
         return;
     }
+    #[cfg(windows)]
+    crate::indirect::split::note_path(crate::indirect::split::NOT_RUN);
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1939,6 +2259,7 @@ impl ValueWait {
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
+        let _kind = crate::readback::consumers::scope(crate::readback::consumers::Kind::Records);
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
             return true;
         }
@@ -2055,9 +2376,13 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         .push((this as usize, wait));
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(windows)]
+    let _call = timed(this);
     wait_for(this, address, comparison, reference, false);
 }
 extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(windows)]
+    let _call = timed(this);
     wait_for(this, address, comparison, reference, true);
 }
 
@@ -2067,6 +2392,8 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    let _call = timed(this);
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2093,10 +2420,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    let _call = timed(this);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    let _call = timed(this);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

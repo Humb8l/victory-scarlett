@@ -63,6 +63,22 @@ pub enum T {
     Remaps,
     RemapUs,
     RemapWaitUs,
+    /// (F3) The title's CPU-view mapping calls (`XMemMapPhysicalPagesScatter`):
+    /// calls, pages in them, time in them.
+    CpuViewCalls,
+    CpuViewPages,
+    CpuViewUs,
+    /// (F10, `crate::framestream`) On the frame thread: page-mapping calls
+    /// and their time; such calls on other threads; not-complete status
+    /// polls and the time from the first to "complete"; enqueues blocked on
+    /// a full queue; batches outstanding when it presented.
+    FrameMapCalls,
+    FrameMapUs,
+    OtherMapCalls,
+    Polls,
+    PollWaitUs,
+    EnqueueBlockedUs,
+    BatchesOutstanding,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -100,7 +116,226 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// (Storage wait job, `crate::faults`) Page faults charged to the
+    /// layer's mapping calls, copies, hashing, texture refreshes,
+    /// DirectStorage requests and resetting write-watch askings.
+    FaultsMap,
+    FaultsCopy,
+    FaultsHash,
+    FaultsUpload,
+    FaultsDisk,
+    FaultsWatch,
+    /// (P1, `crate::host::read_wait`) Waits for a CPU read behind flights:
+    /// all, of fills, of buffer copies, of other reads; their time and its
+    /// split (card still running / landing after); the bytes changed after
+    /// the wait or not; flights and lists in the air at them.
+    ReadWaits,
+    ReadWaitFill,
+    ReadWaitCopy,
+    ReadWaitOther,
+    ReadWaitUs,
+    ReadWaitCardUs,
+    ReadWaitLandUs,
+    ReadChangedYes,
+    ReadChangedNo,
+    ReadWaitFlights,
+    ReadWaitLists,
+    /// Fills read ahead of flights; of them found changed by a flight.
+    FillAhead,
+    FillAheadChanged,
+    /// Fills / copies that waited: a held piece, no read-ahead rule, all wait.
+    FillWaitHeld,
+    FillWaitNoPrediction,
+    FillWaitOther,
+    /// Why a waiting step was not on the card.
+    NotCardSwitch,
+    NotCardUndeclared,
+    NotCardShaderWritten,
+    NotCardNoCopy,
+    NotCardHolds,
+    NotCardRoom,
+    NotCardOther,
+    /// Fills / copies put on the card by prediction (`VICTORY_FILL_PREDICT_CARD`).
+    PredictedCard,
+    /// (Card kinds job, `crate::cardmeter::Inside`) Mirrored from the card
+    /// meter's totals at each frame's end: our commands inside the title's
+    /// lists by kind (clamp, fill, copy, other), runs timed and their
+    /// microseconds (as read about a second after recording), empty pairs.
+    InClampN,
+    InFillN,
+    InCopyN,
+    InOtherN,
+    InClampRuns,
+    InFillRuns,
+    InCopyRuns,
+    InOtherRuns,
+    InFloorRuns,
+    InClampUs,
+    InFillUs,
+    InCopyUs,
+    InOtherUs,
+    InFloorUs,
+    /// Barriers (UAV waits) and transitions of ours by kind, the title's
+    /// pipeline bound again after a pass of ours.
+    InClampBarriers,
+    InFillBarriers,
+    InCopyBarriers,
+    InOtherBarriers,
+    InClampTransitions,
+    InFillTransitions,
+    InCopyTransitions,
+    InOtherTransitions,
+    InRebinds,
+    /// Preludes recorded, their microseconds as read.
+    Preludes,
+    PreludeUs,
+    /// Masked merges (in our send-and-hash lists, not the title's).
+    Merges,
+    /// Constant fills on the card (`crate::host::FILLS`): moved to the
+    /// prelude, of them sharing an earlier one's bytes, prelude copies
+    /// joined; left in place (declared written, storing command first, other).
+    FillHoisted,
+    FillShared,
+    FillJoined,
+    FillWritten,
+    FillStoring,
+    FillOther,
+    /// Lists whose prelude took fills.
+    FillsListsHoisted,
+    /// Sends of lists to the queue, of them finding the card with nothing
+    /// of ours; of the card's idle time, while the submitting thread waited
+    /// for flights to land.
+    CardSends,
+    CardSendsEmpty,
+    CardIdleLandUs,
+    /// Frames whose submissions had not all landed, at each present (this
+    /// one included).
+    FramesInAir,
+    /// Processor time by thread group (user + kernel, microseconds), read
+    /// about once a second (`crate::cpugroups`): title recording, title
+    /// other, our submit thread, relay and copy-back, storage, other of ours.
+    CpuRecordUs,
+    CpuTitleUs,
+    CpuSubmitUs,
+    CpuRelayUs,
+    CpuStorageUs,
+    CpuOursUs,
     Count,
+}
+
+/// (Card kinds job) Totals kept elsewhere copied into [`TOTAL`] at a
+/// frame's end, so that the frame differences carry them.
+fn mirror() {
+    use crate::cardmeter as c;
+    let set = |t: T, v: u64| TOTAL[t as usize].store(v, Relaxed);
+    let k = |a: &[AtomicU64; c::INSIDE], i: usize| a[i].load(Relaxed);
+    for (i, (n, runs, us)) in [
+        (T::InClampN, T::InClampRuns, T::InClampUs),
+        (T::InFillN, T::InFillRuns, T::InFillUs),
+        (T::InCopyN, T::InCopyRuns, T::InCopyUs),
+        (T::InOtherN, T::InOtherRuns, T::InOtherUs),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set(n, k(&c::INSIDE_COMMANDS, i));
+        set(runs, k(&c::INSIDE_RUNS, i));
+        set(us, k(&c::INSIDE_US, i));
+    }
+    set(T::InFloorRuns, k(&c::INSIDE_RUNS, c::Inside::Floor as usize));
+    set(T::InFloorUs, k(&c::INSIDE_US, c::Inside::Floor as usize));
+    for (i, (b, t)) in [
+        (T::InClampBarriers, T::InClampTransitions),
+        (T::InFillBarriers, T::InFillTransitions),
+        (T::InCopyBarriers, T::InCopyTransitions),
+        (T::InOtherBarriers, T::InOtherTransitions),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set(b, k(&c::INSIDE_BARRIERS, i));
+        set(t, k(&c::INSIDE_TRANSITIONS, i));
+    }
+    set(T::InRebinds, c::INSIDE_REBINDS.load(Relaxed));
+    set(T::Preludes, c::PRELUDES[0].load(Relaxed));
+    set(T::PreludeUs, c::PRELUDES[1].load(Relaxed));
+    let f = |i: usize| crate::host::FILLS[i].load(Relaxed);
+    set(T::FillHoisted, f(crate::host::FILL_HOISTED));
+    set(T::FillShared, f(crate::host::FILL_SHARED));
+    set(T::FillJoined, f(crate::host::FILL_JOINED));
+    set(T::FillWritten, f(crate::host::FILL_WRITTEN));
+    set(T::FillStoring, f(crate::host::FILL_STORING));
+    set(T::FillOther, f(crate::host::FILL_OTHER));
+    set(T::FillsListsHoisted, f(crate::host::FILL_LISTS));
+}
+
+/// (Card kinds job) The make-up's part for layer work inside the title's
+/// lists, the card's sends and idle split, frames in the air at present
+/// (`fia_max`: the most in the frames the make-up stands for) and
+/// processor time by thread group.
+fn inside_text(t: &dyn Fn(T) -> f64, fia_max: f64) -> String {
+    let ms = |x: T| t(x) / 1e3;
+    let in_us = ms(T::InClampUs) + ms(T::InFillUs) + ms(T::InCopyUs) + ms(T::InOtherUs);
+    let floor = if t(T::InFloorRuns) > 0.0 { t(T::InFloorUs) / t(T::InFloorRuns) } else { 0.0 };
+    let fills = t(T::FillHoisted) + t(T::FillWritten) + t(T::FillStoring) + t(T::FillOther);
+    let idle = ms(T::CardIdleUs);
+    let (prep, land) = (ms(T::CardIdleBehindUs), ms(T::CardIdleLandUs));
+    format!(
+        "layer work inside title lists: clamps {:.0} ({:.2} ms), preludes {:.0} ({:.2} ms), card fills {:.0} ({:.2} ms; barriers {:.0}, \
+         transitions {:.0}), card copies {:.0} ({:.2} ms), merges {:.1} (in our send lists, not the title's), other {:.0} ({:.2} ms); \
+         total {:.2} ms of the title lists' {:.1} ms (runs timed {:.0}, an empty pair {:.1} us, clamp barriers {:.0} transitions {:.0}, \
+         copy barriers {:.0}, title pipeline bound again {:.0}; VICTORY_CARD_METER_KINDS) | card fills {:.0}: hoisted to the prelude {:.0}, \
+         coalesced {:.0} (same bytes {:.0}, joined copies {:.0}), left in place {:.0} (source written earlier in the list {:.0}, a dispatch or \
+         storing draw first {:.0}, dest read by an earlier draw 0, same dest twice 0, other {:.0}); transitions saved {:.0} \
+         (VICTORY_CARD_FILLS_BATCH={}) | sends that found the card empty {:.1} of {:.1}; card idle split: while we were preparing {prep:.1} / \
+         while landing {land:.1} / while the title recorded {:.1} ms | frames in the air at present: mean {:.2}, max {fia_max:.0} | CPU per \
+         frame by thread group: title recording {:.1}, title other {:.1}, submit {:.1}, relay/copy-back {:.1}, storage {:.1}, other {:.1} ms \
+         (user+kernel)",
+        t(T::InClampN),
+        ms(T::InClampUs),
+        t(T::Preludes),
+        ms(T::PreludeUs),
+        t(T::InFillN),
+        ms(T::InFillUs),
+        t(T::InFillBarriers),
+        t(T::InFillTransitions),
+        t(T::InCopyN),
+        ms(T::InCopyUs),
+        t(T::Merges),
+        t(T::InOtherN),
+        ms(T::InOtherUs),
+        in_us + ms(T::PreludeUs),
+        ms(T::CardListsUs),
+        t(T::InClampRuns) + t(T::InFillRuns) + t(T::InCopyRuns) + t(T::InOtherRuns),
+        floor,
+        t(T::InClampBarriers),
+        t(T::InClampTransitions),
+        t(T::InCopyBarriers),
+        t(T::InRebinds),
+        fills,
+        t(T::FillHoisted),
+        t(T::FillShared) + t(T::FillJoined),
+        t(T::FillShared),
+        t(T::FillJoined),
+        t(T::FillWritten) + t(T::FillStoring) + t(T::FillOther),
+        t(T::FillWritten),
+        t(T::FillStoring),
+        t(T::FillOther),
+        // Each fill in place has a UAV wait and two transitions (one for
+        // the first of a list); the hoisted ones share two per list.
+        (2.0 * t(T::FillHoisted) - 2.0 * t(T::FillsListsHoisted)).max(0.0),
+        crate::host::fills_batch(),
+        t(T::CardSendsEmpty),
+        t(T::CardSends),
+        (idle - prep - land).max(0.0),
+        t(T::FramesInAir),
+        ms(T::CpuRecordUs),
+        ms(T::CpuTitleUs),
+        ms(T::CpuSubmitUs),
+        ms(T::CpuRelayUs),
+        ms(T::CpuStorageUs),
+        ms(T::CpuOursUs),
+    )
 }
 
 const N: usize = T::Count as usize;
@@ -109,6 +344,11 @@ static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 /// Adds to a total.
 pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
+}
+
+/// A total so far.
+pub fn total(t: T) -> u64 {
+    TOTAL[t as usize].load(Relaxed)
 }
 
 /// Takes from a total (a time that was summed over threads is corrected
@@ -322,7 +562,7 @@ fn free_mb() -> u64 {
 }
 
 /// Values read when a frame ends, all running totals but the last.
-const S: usize = 11;
+const S: usize = 12;
 const S_THREAD_USER: usize = 0;
 const S_THREAD_KERNEL: usize = 1;
 const S_PROCESS_USER: usize = 2;
@@ -335,6 +575,8 @@ const S_STAGING_REUSED: usize = 8;
 const S_STAGING_MADE: usize = 9;
 /// Not a total: the free memory then.
 const S_FREE_MB: usize = 10;
+/// (`crate::faults`) Hard faults, as last read (up to 250 ms old).
+const S_HARD_FAULTS: usize = 11;
 
 fn sample() -> [u64; S] {
     let (tu, tk) = thread_times();
@@ -351,6 +593,7 @@ fn sample() -> [u64; S] {
         crate::texture::SPARE_STATS[0].load(Relaxed),
         crate::texture::SPARE_STATS[1].load(Relaxed),
         free_mb(),
+        crate::faults::hard_faults(),
     ]
 }
 
@@ -391,7 +634,7 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
 }
 
 /// A frame's make-up as text (`f` may be a mean of frames).
-fn text(f: &Frame) -> String {
+fn text(f: &Frame, fia_max: f64) -> String {
     let t = |x: T| f.t[x as usize];
     let ms = |x: T| f.t[x as usize] / 1e3;
     let s = |i: usize| f.s[i];
@@ -404,9 +647,10 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
-         faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
-         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
+         readers); cpu view {:.0} calls {:.0} pages {:.1} ms | frame thread streaming: mapping {:.1} ms in {:.0} calls ({:.0} on \
+         other threads), {:.0} not-complete polls {:.1} ms, enqueue blocked {:.1} ms, batches outstanding {:.0} | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         faults: {:.0} page, {:.0} guard{} | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0} | {} | {}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
         s(S_THREAD_USER) / 1e3,
@@ -446,6 +690,16 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::CpuViewCalls),
+        t(T::CpuViewPages),
+        ms(T::CpuViewUs),
+        ms(T::FrameMapUs),
+        t(T::FrameMapCalls),
+        t(T::OtherMapCalls),
+        t(T::Polls),
+        ms(T::PollWaitUs),
+        ms(T::EnqueueBlockedUs),
+        t(T::BatchesOutstanding),
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
@@ -454,6 +708,16 @@ fn text(f: &Frame) -> String {
         ms(T::DiskUs),
         s(S_PAGE_FAULTS),
         t(T::GuardFaults),
+        if crate::faults::on() {
+            let d: Vec<u64> = [T::FaultsMap, T::FaultsCopy, T::FaultsHash, T::FaultsUpload, T::FaultsDisk, T::FaultsWatch]
+                .iter()
+                .map(|&x| t(x) as u64)
+                .chain([s(S_PAGE_FAULTS) as u64, s(S_HARD_FAULTS) as u64])
+                .collect();
+            crate::faults::text(&d).replacen("; ", " (", 1) + ")"
+        } else {
+            String::new()
+        },
         s(S_PROCESS_USER) / 1e3,
         s(S_PROCESS_KERNEL) / 1e3,
         ms(T::PaceUs),
@@ -465,6 +729,8 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+        crate::host::read_wait::text(|x| f.t[x as usize], crate::host::read_wait::held_pieces()),
+        inside_text(&|x| f.t[x as usize], fia_max),
     )
 }
 
@@ -500,6 +766,7 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     let each: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.us / 1e3)).collect();
     let shortest = frames.iter().map(|f| f.us).fold(f64::INFINITY, f64::min);
     let longest = frames.iter().map(|f| f.us).fold(0.0, f64::max);
+    let fia_max = plain.iter().map(|f| f.t[T::FramesInAir as usize]).fold(0.0, f64::max);
     let mut out = vec![format!(
         "frame times: {} frames in {seconds:.1} s: shortest {:.0} ms, median {:.0}, longest {:.0}; {} long (over {:.0} ms, \
          the usual frame of the last {RECENT} being {:.0}); each: {}",
@@ -513,10 +780,10 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
         each.join(" ")
     )];
     if !plain.is_empty() {
-        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain))));
+        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain), fia_max)));
     }
     for f in long.iter().take(LONG_MOST) {
-        out.push(format!("long frame {} at {:.1} s: {}", f.number, f.at, text(f)));
+        out.push(format!("long frame {} at {:.1} s: {}", f.number, f.at, text(f, f.t[T::FramesInAir as usize])));
     }
     if long.len() > LONG_MOST {
         out.push(format!("long frames: {} more in this reading are not listed", long.len() - LONG_MOST));
@@ -529,6 +796,42 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
 const RECENT: usize = 64;
 const LONG_MOST: usize = 8;
 
+/// (Card kinds job) Once a second: [`inside_text`] per frame over the
+/// frames of that second (card times are of lists of about a second before).
+fn per_second() {
+    struct Second {
+        since: std::time::Instant,
+        totals: [u64; N],
+        frames: u64,
+        fia_max: u64,
+        fia_last: u64,
+    }
+    static SECOND: Mutex<Option<Second>> = Mutex::new(None);
+    let totals: [u64; N] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
+    let mut second = SECOND.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = second.as_mut() else {
+        *second = Some(Second {
+            since: std::time::Instant::now(),
+            totals,
+            frames: 0,
+            fia_max: 0,
+            fia_last: totals[T::FramesInAir as usize],
+        });
+        return;
+    };
+    s.frames += 1;
+    let fia = totals[T::FramesInAir as usize];
+    s.fia_max = s.fia_max.max(fia.wrapping_sub(s.fia_last));
+    s.fia_last = fia;
+    if s.since.elapsed() < std::time::Duration::from_secs(1) {
+        return;
+    }
+    let frames = s.frames.max(1) as f64;
+    let per: [f64; N] = std::array::from_fn(|i| totals[i].wrapping_sub(s.totals[i]) as i64 as f64 / frames);
+    tracing::info!("per frame over the last {:.1} s ({} frames): {}", s.since.elapsed().as_secs_f64(), s.frames, inside_text(&|x| per[x as usize], s.fia_max as f64));
+    *s = Second { since: std::time::Instant::now(), totals, frames: 0, fia_max: 0, fia_last: fia };
+}
+
 /// A frame ends: called at the end of the title's present call, on the
 /// thread that made it.
 pub fn frame() {
@@ -540,6 +843,12 @@ pub fn frame() {
     if on_slow_core() {
         add(T::RenderSlow, 1);
     }
+    // (Card kinds job) Frames in the air at this present; processor time by
+    // thread group (read about once a second); totals kept elsewhere.
+    add(T::FramesInAir, crate::host::frames_in_air());
+    crate::cpugroups::sample();
+    mirror();
+    per_second();
     let now = std::time::Instant::now();
     let totals: [u64; N] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
     let sampled = sample();

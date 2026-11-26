@@ -73,6 +73,12 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// at most every 20 s).
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
+/// (Storage wait job) Pipelines stored into the library since the start,
+/// and times its file was written.
+pub(crate) static STORED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// A save is running on the saving thread ([`save_due`]).
+static SAVING_NOW: AtomicBool = AtomicBool::new(false);
 
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
@@ -433,6 +439,8 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// A library the driver refused, kept as it was ([`open`]; fxceless 79cfdd9).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -461,6 +469,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -479,7 +488,10 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                rejected = true;
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -487,6 +499,15 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    // And the file is kept under another name, not written over by this
+    // run's first save: a refusal may be this device's alone (fxceless run
+    // 263: an empty library was saved over 366 MB of built pipelines, and
+    // the next run drew black until they were built again).
+    if rejected && let Some(dir) = DIR.get() {
+        if let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
+            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        }
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -560,18 +581,74 @@ pub(crate) fn pipeline(
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
+        STORED.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+/// When the library was last saved (or a save was tried).
+static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// (Storage wait job) Pipelines stored and not yet written to the file.
+pub(crate) fn pending() -> u64 {
+    library().map_or(0, |l| l.added.load(Ordering::Relaxed))
+}
+
+/// (Storage wait job) Called once a second by the host's sweep: a library
+/// with pipelines not yet written is saved on a thread of its own once
+/// [`SAVE_DUE`] has passed since the last save (`VICTORY_LIBRARY_SAVE_S`,
+/// 10; 0: as before). Before, a save came only from a pipeline worker after
+/// a make, at most every 20 s, and at a clean exit: pipelines made in the
+/// last 20 s before the next make, or before the watchdog ends the run at
+/// its time limit, were never written (run-49: 18 made at 355 s, the last
+/// save at 341 s, the run ended at 360 s; the next run made them again,
+/// 3.7 s of waits in one frame). The file is written as always: to a
+/// temporary file, renamed over the library's.
+pub(crate) fn save_due() {
+    static S: OnceLock<u64> = OnceLock::new();
+    let secs = *S.get_or_init(|| {
+        let s = std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10u64);
+        tracing::info!("host pipeline library: written {} (VICTORY_LIBRARY_SAVE_S={s})", if s == 0 { "by the workers at most every 20 s and at exit, as before" } else { "when pipelines wait to be written and the last save is that many seconds old" });
+        s
+    });
+    if secs == 0 || pending() == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    if LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(secs)) {
+        return;
+    }
+    if SAVING_NOW.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let work = || {
+        save(true);
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    };
+    if std::thread::Builder::new().name("victory-library-save".into()).spawn(work).is_err() {
+        SAVING_NOW.store(false, Ordering::Relaxed);
+    }
+}
+
+/// (Storage wait job) The library's counts for the memory line.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn counts_line() -> String {
+    format!(
+        "pipeline library: loaded {}, made {} (stored {}, pending {}), file written {} times",
+        LOADED.load(Ordering::Relaxed),
+        MADE.load(Ordering::Relaxed),
+        STORED.load(Ordering::Relaxed),
+        pending(),
+        WRITTEN.load(Ordering::Relaxed)
+    )
 }
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
@@ -613,6 +690,7 @@ pub(crate) fn save(now: bool) {
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
+        WRITTEN.fetch_add(1, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {

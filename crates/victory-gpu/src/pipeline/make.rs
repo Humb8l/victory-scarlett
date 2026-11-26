@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -33,6 +33,13 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When a worker (or a thread making it itself) began it ([`slow`]).
+    begun: OnceLock<Instant>,
+    /// (fxceless a35c557) The formats its state declares for what a draw draws into
+    /// (zeros without a graphics state), and the same shaders and state for other formats
+    /// bound at a draw ([`for_formats`]): a chain, one link per set of formats met.
+    pub(crate) formats: TargetFormats,
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -42,6 +49,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    /// Whether it is a compute pipeline.
+    fn computes(&self) -> bool {
+        matches!(self.shaders.as_slice(), [only] if only.stage == "compute")
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -50,16 +62,20 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            begun: OnceLock::new(),
         }
     }
 
     fn make(&self) {
+        let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -106,12 +122,117 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// Whether a frame may wait longer for its pipelines while a world loads
+/// (`VICTORY_PIPELINE_LOAD_WAIT=0`: the budget per frame alone, as
+/// before). On by default. From allforks 4eac58d (myokex/victory-amd
+/// 4436f8f), without its leaving out of the ray-tracing resolve programs.
+///
+/// "While a world loads" is told as the source tells it: by no sign of the
+/// title's, but by what has been waited. Every wait may go past the budget
+/// per frame up to [`LOADING_FRAME`] (graphics) or
+/// [`LOADING_FRAME_COMPUTE`] (compute, counted apart), until such waits
+/// past the budget come to `VICTORY_PIPELINE_GATE_S` (120 s) in the run;
+/// pipelines are asked for by the hundred only while a world loads, so
+/// that is when the time goes. A pipeline the driver has been at for long
+/// ([`slow`]) is not waited for. A frame waits at most 4 + 12 s more, well
+/// under the title's GPU watchdog of about 30 s; with
+/// `VICTORY_PIPELINE_WAIT_SHARED=0` (a budget per thread, so five
+/// recording threads could each wait it) the longer waits are not taken.
+fn load_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOAD_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host's driver has been at `p` for longer than most take
+/// (one of the title's takes 85 s): no frame waits for it ([`load_wait`]).
+fn slow(p: &Pending) -> bool {
+    // A pass a title runs once (it unpacks a model, say) is lost if its
+    // pipeline is not there; a draw comes again in the next frame.
+    let most = if p.computes() { 10 } else { 3 };
+    p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
+}
+
+/// What a frame may wait while a world loads ([`load_wait`]): pipelines
+/// are asked for by the hundred then, and a pass the title runs once is
+/// lost if its pipeline is not there.
+const LOADING_FRAME: Duration = Duration::from_secs(4);
+/// The same for compute pipelines, waited for apart: the passes that unpack
+/// a world's models are dispatched once, and in a run whose pipelines were
+/// all still to be loaded 130 of them were dropped, and with them walls,
+/// floor, ceiling and faces (they never came back).
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+
+/// What is left of `VICTORY_PIPELINE_GATE_S` (120 s; 0: no longer waits)
+/// after `spent` of waits past the budget per frame.
+fn loading_left(spent: Duration) -> Duration {
+    static TOTAL: OnceLock<Duration> = OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        Duration::from_secs(seconds)
+    });
+    total.saturating_sub(spent)
+}
+
+/// Since the start, in milliseconds: what frames waited for graphics and
+/// for compute pipelines past the budget per frame ([`load_wait`]).
+pub(crate) static LOADING_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// (fxceless a35c557) Pipelines made again for the formats bound at a draw, since the start.
+pub(crate) static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares gets a host
+/// pipeline for those formats ([`for_formats`]); `VICTORY_TARGET_VARIANTS=0` sends such a
+/// draw with the title's pipeline, as before.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// (fxceless a35c557) The host pipeline for a draw with `p` into views of the formats
+/// `bound`, which `p` does not declare (`host::formats_differ`): that of the same shaders
+/// and state for those formats, a pipeline like the title's own (queued at its first draw,
+/// the draw dropped while it is not there, [`ready`]).
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and its state `g` for the formats `bound`: found in the
+/// chain that starts at `p`, or added to it (logged then, once per pipeline and formats).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = ?p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(),
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
@@ -160,16 +281,30 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() {
+    let plain = wait_budget();
+    let shared = shared_budget();
+    let loads = load_wait() && shared;
+    if plain.is_zero() || (loads && slow(p)) {
         return;
     }
+    // While a world loads: longer, compute pipelines apart.
+    let compute = loads && p.computes();
+    let past_total = &LOADING_WAITED[usize::from(compute)];
+    let budget = if loads {
+        let loading = loading_left(Duration::from_millis(
+            LOADING_WAITED.iter().map(|w| w.load(Ordering::Relaxed)).sum(),
+        ));
+        plain.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading))
+    } else {
+        plain
+    };
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
-    let shared = shared_budget();
+    // taken by a thread waiting now); compute pipelines' apart while a
+    // world loads.
+    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let frame_spent = &SPENTS[usize::from(compute)];
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -185,17 +320,33 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !(loads && slow(p)) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        // Woken now and then to see whether it has become a slow one.
+        let rest = if loads { rest.min(Duration::from_millis(250)) } else { rest };
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if loads {
+        let past = waited.saturating_sub(plain);
+        if !past.is_zero() {
+            let before = past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
+            if before == 0 {
+                tracing::info!(
+                    compute,
+                    waited_ms = waited.as_millis() as u64,
+                    "a frame waited for a pipeline past its budget while a world loads \
+                     (VICTORY_PIPELINE_LOAD_WAIT; at most 4 s graphics, 12 s compute a frame, VICTORY_PIPELINE_GATE_S in all)"
+                );
+            }
+        }
+    }
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -375,6 +526,23 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    /// While a world loads no frame waits for a pipeline the driver has
+    /// been at for long (3 s for one that is not a compute pipeline), and
+    /// the longer waits of the run end when their bound is spent.
+    #[test]
+    fn long_compiles_are_not_waited_for() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(!p.computes());
+        assert!(!slow(&p), "not begun");
+        let _ = p.begun.set(Instant::now() - Duration::from_secs(4));
+        assert!(slow(&p));
+        let q = Pending::new(Vec::new(), None);
+        let _ = q.begun.set(Instant::now());
+        assert!(!slow(&q));
+        assert_eq!(loading_left(Duration::from_secs(500)), Duration::ZERO);
+        assert!(LOADING_FRAME + LOADING_FRAME_COMPUTE < Duration::from_secs(20), "well under the title's 30 s watchdog");
     }
 
     #[test]

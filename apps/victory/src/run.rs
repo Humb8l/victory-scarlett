@@ -127,6 +127,8 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // SAFETY: the mapped title image, none of whose code has run yet.
+    unsafe { victory_hle::readback::install(image.base()) };
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

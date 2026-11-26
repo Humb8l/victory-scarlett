@@ -250,3 +250,8 @@ mod tests {
         assert!(tick > flips[3]);
     }
 }
+
+/// Draws of the most recent presented frame (the per-frame number the
+/// window caption averages as "N draws"), set at each present; read by the
+/// scripted input (`VICTORY_AUTO_INPUT` waits such as `d>=40`).
+pub static PRESENTED_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

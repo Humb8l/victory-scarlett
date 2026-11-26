@@ -277,6 +277,11 @@ impl Shader {
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
     }
+
+    /// The container as the title gave it (`crate::heap_marks` tags it).
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
 }
 
 /// Whether a console container's code tests rays against the nodes of a
@@ -479,6 +484,29 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// (fxceless a35c557) As [`host_pipeline`], for a draw into render target and depth views
+/// of the formats `bound`: if a bound view has another format than the title's pipeline
+/// declares for its slot (`host::formats_differ`), the host pipeline of the same shaders
+/// and state made for the bound formats (`make::for_formats`). A draw whose views are as
+/// declared pays one comparison of nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
+/// Pipelines made again for the formats bound at their draw, since the start.
+#[cfg(windows)]
+pub(crate) fn variants_made() -> u64 {
+    make::VARIANTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Host pipelines queued and not made yet.
@@ -787,6 +815,15 @@ mod library;
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).
+/// (Storage wait job) The library's counts for the memory line.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn library_counts_line() -> String {
+    #[cfg(windows)]
+    return library::counts_line();
+    #[cfg(not(windows))]
+    String::new()
+}
+
 #[cfg(windows)]
 pub(crate) fn frame_log_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -800,6 +837,7 @@ mod make;
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
+    library::save_due();
 }
 
 /// The pipeline library's part of the report when the host device is

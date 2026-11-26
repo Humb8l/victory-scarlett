@@ -27,6 +27,73 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root UAV `u<SLOT_HEAP_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// stores (or does an atomic operation) through a buffer view it picks from
+/// the view heap at an index it computes: [`HEAP_MARKS_DWORDS`] dwords the
+/// host keeps, dword `i` set to 1 by every such store through heap slot `i`
+/// (the last dword is a sink, for lanes that do not store). On the console
+/// the store is in title memory at once; here it lands in a host copy, and
+/// the host copies back only ranges it knows were written. Tables name what
+/// a draw may write, nothing names what a computed index picks: the marks
+/// tell the host which picked views shaders really write
+/// (`victory-gpu`'s `heap_marks`). Title root views take `u<parameter>`
+/// (below 64), ours 252 to 255 (`SLOT_FAULTS` 253): no clash. Ported from
+/// the all-forks tree (a1ce531), off with `VICTORY_HEAP_MARKS=0`
+/// ([`heap_marks`]).
+pub const SLOT_HEAP_MARKS: u8 = 252;
+/// Dwords of the [`SLOT_HEAP_MARKS`] buffer: one per heap slot, and the sink.
+pub const HEAP_MARKS_DWORDS: u32 = SLOT_STRIDES_COUNT + 1;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`heap_marks`] as given instead of the switch.
+    pub(crate) static TEST_HEAP_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether stores and atomic operations through buffer views picked from
+/// the view heap by index mark their slot ([`SLOT_HEAP_MARKS`];
+/// `VICTORY_HEAP_MARKS=0`: not, and programs translate as before). Read
+/// here so the switch is part of the translation's fingerprint
+/// (`translation_fingerprint`).
+pub fn heap_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HEAP_MARKS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_MARKS").is_none_or(|v| v != "0"))
+}
+
+/// The value a program's marks hold ([`SLOT_HEAP_MARKS`]): [`heap_mark_tag`]
+/// of the container being translated (1 outside [`super::translate`]).
+pub(crate) fn mark_tag() -> u32 {
+    MARK_TAG.get().max(1)
+}
+
+thread_local! {
+    /// See [`mark_tag`]; set by [`super::translate`] for its container.
+    pub(crate) static MARK_TAG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The value the program translated from `container` stores in the marks
+/// of the heap slots it stores through ([`SLOT_HEAP_MARKS`]): 32-bit FNV-1a
+/// of the container with the low bit set (never 0, which is "not marked").
+/// The host computes the same from the container it holds, to tell which
+/// program left a mark.
+pub fn heap_mark_tag(container: &[u8]) -> u32 {
+    let mut h = 0x811c_9dc5u32;
+    for &b in container {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h | 1
+}
+
+/// Stores and atomic operations through views picked by index in programs
+/// of stages that do not mark them ([`SLOT_HEAP_MARKS`]), since the start:
+/// what they write stays in the host copies.
+pub static UNMARKED_PICKED_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -69,9 +136,28 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; the host at most 65,535, so a larger dispatch runs in
+/// parts, each with the groups before it here. Asked for by compute programs
+/// that are told the x number alone (the one-dimensional ones), while
+/// [`dispatch_parts`] is on.
+pub const USER_GROUP_BASE: u32 = 0x104;
+
+/// Whether compute dispatches of more than 65,535 groups in x run in parts
+/// (programs that read their group's number in x alone add
+/// [`USER_GROUP_BASE`]); `VICTORY_DISPATCH_PARTS=0` translates them as before
+/// and the host clamps such dispatches. Read here so the switch is part of the
+/// translation's fingerprint (`translation_fingerprint`).
+pub fn dispatch_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_PARTS").is_none_or(|v| v != "0"))
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;

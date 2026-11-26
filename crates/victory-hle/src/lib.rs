@@ -13,6 +13,10 @@
 
 mod host;
 pub mod modules;
+#[cfg(windows)]
+pub mod readback;
+#[cfg(windows)]
+pub mod chunkmeter;
 mod registry;
 pub mod runtime;
 

@@ -19,6 +19,9 @@
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod cpugroups;
+pub mod hangwatch;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -31,8 +34,21 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod framestream;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod texdetail;
+pub mod gpuview;
+pub mod mapfast;
 #[cfg(windows)]
 pub mod framelog;
+#[cfg(windows)]
+pub mod faults;
+#[cfg(windows)]
+mod declstat;
+#[cfg(windows)]
+mod heap_marks;
+#[cfg(windows)]
+mod heap_pass;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -44,12 +60,29 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+
+/// (F19 meter) Frames presented so far (`frame::current`).
+pub fn frames_presented() -> u64 {
+    frame::current()
+}
+
+/// (`VICTORY_MAP_PREFAULT`, for the hle side) One byte of each 4 KiB page of
+/// `[at, at + len)` read with no lock, a missing page ending it harmlessly:
+/// the pages read, and whether it ended early.
+#[cfg(windows)]
+pub fn prefault_touch(at: usize, len: usize) -> (usize, bool) {
+    plaincopy::touch(at, len)
+}
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+pub mod readback;
+#[cfg(windows)]
+mod ranges;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
@@ -66,11 +99,19 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+#[cfg(windows)]
+mod shell;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod views;
+#[cfg(windows)]
+pub mod chunks;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -79,7 +120,9 @@ pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
+pub use shell::{use_title_dir, window_destroyed};
+#[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_unmapped,
     title_memory_written, writing as kernel_will_write,
 };

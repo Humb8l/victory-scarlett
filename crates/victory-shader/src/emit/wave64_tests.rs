@@ -140,6 +140,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     })
 }
 
@@ -819,6 +820,10 @@ fn run_paired(shader: &HostShader, constants: [u32; 4], dwords: u32) -> Option<V
         if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
             ud[u.index as usize] = constants[d as usize];
         }
+        // (the number of the first group, as the second part of a dispatch in parts has it)
+        if u.root == RootType::Other(super::USER_GROUP_BASE) {
+            ud[u.index as usize] = 65_535;
+        }
     }
     let mut out = host
         .dispatch(
@@ -1161,4 +1166,208 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     };
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
+}
+
+/// A console wave64 program that reads its group's number in x alone, on a host of 32-lane
+/// waves: in the halves form (`ds_swizzle_b32`, confined to 32 lanes: a host wave of 32 for
+/// each half) and in the paired form (`v_mbcnt` takes lanes of both halves) it asks for the
+/// number of the first group (`USER_GROUP_BASE`) and adds it, in every lane of both halves:
+/// the forms keep the console's groups one to one, so a dispatch in parts numbers its groups
+/// as one dispatch would.
+#[test]
+fn a_wave64_group_number_in_x_counts_from_the_first_group_on_a_32_lane_host() {
+    const BASE: u32 = 65_535;
+    let asks = |s: &HostShader| s.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
+    // The group's number in x arrives in s5 (after the 5 user SGPRs), which the
+    // program's prologue overwrites: kept in s12 first.
+    let with_group = |body: &[u32]| {
+        let mut n = native_with(body, true, 64, 0);
+        n.code.splice(0..0, sop1(0x03, 12, 5).to_le_bytes()); // s_mov_b32 s12, s5
+        if let StageIo::Cs(cs) = &mut n.io {
+            cs.rsrc2 |= 1 << 7; // the group's number in x
+        }
+        n
+    };
+    // halves: the group's number, the lane, and the lane of the other 16-lane row
+    let mut w = vec![vop1(0x01, 1, 12), vop1(0x01, 2, v(0))]; // v_mov_b32 v1, s12; v2, v0
+    w.extend(ds(0x35, 3, 2, 0, 0x401F)); // ds_swizzle_b32 v3, v2 offset:swizzle(BITMASK_PERM, xor 16)
+    w.extend(stores([1, 2, 1, 3]));
+    let n = with_group(&w);
+    let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+    let halves = lowered(&n, &p, &HashSet::new()).expect("the halves form");
+    assert!(asks(&halves), "the halves form asks for the first group");
+    let want_halves: Vec<u32> = (0..64).flat_map(|n| [BASE, n, BASE, n & 32 | (n & 31) ^ 16]).collect();
+    // paired: the lane index counted across the halves
+    let mut w = vec![vop1(0x01, 1, 12)];
+    w.extend(vop3(0x365, 2, 193, k(0))); // v_mbcnt_lo_u32_b32 v2, -1, 0
+    w.extend(vop3(0x366, 2, 193, v(2))); // v_mbcnt_hi_u32_b32 v2, -1, v2
+    w.extend(stores([1, 2, 1, 2]));
+    let paired = paired(&with_group(&w));
+    assert!(asks(&paired), "the paired form asks for the first group");
+    let want_paired: Vec<u32> = (0..64).flat_map(|n| [BASE, n, BASE, n]).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, want) in [(&halves, &want_halves), (&paired, &want_paired)] {
+        let Some(got) = run_paired(shader, [0; 4], 256) else { return };
+        same_as_console(&got, want);
+    }
+    eprintln!("ran: every lane of both halves numbered its group from the first group's number, in both forms");
+}
+
+/// [`native_with`] with the descriptor in s[8:11] picked from the view heap (the root
+/// parameter at s4 the resource heap's base, no used-resource entry): stores through it are
+/// stores through a view picked by index.
+fn native_picked(body: &[u32]) -> NativeProgram {
+    let mut n = native_with(body, true, 64, 0);
+    n.layout[1].root = RootType::ResourceHeap;
+    n.used.clear();
+    n
+}
+
+/// `native` lowered for a host of 32-lane waves, in the paired form if `paired` (else the
+/// form the program takes without it: the halves form for code confined to 32 lanes), with
+/// the marks of heap slots stored through on or off (`super::shader::heap_marks`).
+fn lowered_marks(native: &NativeProgram, paired: bool, marks: bool) -> lower::Lowered {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure_wide(&p, &HashSet::new()).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let on = super::shader::TEST_HEAP_MARKS.replace(Some(marks));
+    let parts = lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    };
+    let lowered = if paired {
+        lower::with_paired_lanes(|| lower::lower(&parts))
+    } else {
+        lower::lower(&parts)
+    };
+    super::shader::TEST_HEAP_MARKS.set(on);
+    lower::TEST_HOST_WAVE.set(wave);
+    let lowered = lowered.expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    lowered
+}
+
+/// A console wave64 program that stores through a buffer view it picks from the view heap,
+/// on a host of 32-lane waves: in the paired form (`v_mbcnt` counts lanes across the halves)
+/// every console lane's store marks the heap slot (two marks per store, the lower and the
+/// upper lane of each thread, the guarded store's under its lane's EXEC); in the halves form
+/// (`ds_swizzle_b32` stays inside 32 lanes) one per store. The marks' root view is ours
+/// (`SLOT_HEAP_MARKS`), and with the switch off nothing of it is emitted.
+#[test]
+fn a_store_through_a_picked_view_marks_its_slot_in_both_forms_on_a_32_lane_host() {
+    use super::shader::SLOT_HEAP_MARKS;
+    // paired: four stores, then one by the lanes below s0 only
+    let mut w = Vec::new();
+    w.extend(vop3(0x365, 2, 193, k(0))); // v_mbcnt_lo_u32_b32 v2, -1, 0
+    w.extend(vop3(0x366, 2, 193, v(2))); // v_mbcnt_hi_u32_b32 v2, -1, v2
+    w.extend(stores([2, 2, 2, 2]));
+    w.push(0x7D88_0000); // v_cmp_gt_u32 vcc, s0, v0
+    w.push(0xBE8C_246A); // s_and_saveexec_b64 s[12:13], vcc
+    w.extend(store(2, 15, 16)); // buffer_store_dword v2, v15, s[8:11], 0 offen offset:16
+    w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    let n = native_picked(&w);
+    let paired = lowered_marks(&n, true, true);
+    assert_eq!(paired.wave_size, Some(32), "the paired form");
+    assert!(paired.root_uavs.contains(&SLOT_HEAP_MARKS));
+    assert_eq!(paired.heap_marks, 2 * 5, "each store marks for both lanes of a thread");
+    let off = lowered_marks(&n, true, false);
+    assert!(!off.root_uavs.contains(&SLOT_HEAP_MARKS));
+    assert_eq!(off.heap_marks, 0);
+    assert_ne!(off.dxil, paired.dxil);
+    // halves: one console lane a host lane
+    let mut w = vec![vop1(0x01, 2, v(0))]; // v_mov_b32 v2, v0
+    w.extend(ds(0x35, 3, 2, 0, 0x401F)); // ds_swizzle_b32 v3, v2 offset:swizzle(BITMASK_PERM, xor 16)
+    w.extend(stores([2, 3, 2, 3]));
+    let n = native_picked(&w);
+    let halves = lowered_marks(&n, false, true);
+    assert!(halves.root_uavs.contains(&SLOT_HEAP_MARKS));
+    assert_eq!(halves.heap_marks, 4, "one mark per store");
+    // A table's view (the program as `native_with` makes it) is no picked one: no mark.
+    let table = lowered_marks(&native_with(&w, true, 64, 0), false, true);
+    assert!(!table.root_uavs.contains(&SLOT_HEAP_MARKS));
+    assert_eq!(table.heap_marks, 0);
+    // Without a picked store the program is the same with the switch on or off.
+    let off = lowered_marks(&native_with(&w, true, 64, 0), false, false);
+    assert_eq!(off.dxil, table.dxil, "VICTORY_HEAP_MARKS=0 changes nothing where nothing marks");
+}
+
+/// Ported from the all-forks tree (a1ce531, its GPU test of heap stores): a console program
+/// of 32-lane waves (it runs on any host, WARP too) whose lanes below s0 store through a raw
+/// buffer it picks from the view heap (slot 0) runs with the marks bound (`Root::Written`) and
+/// the table of strides: the store lands, the mark of slot 0 is the program's tag, the lanes
+/// that do not store mark the sink, and no other slot is marked.
+#[test]
+fn a_store_through_a_picked_view_marks_its_slot_on_the_device() {
+    use super::shader::{HEAP_MARKS_DWORDS, SLOT_HEAP_MARKS, SLOT_STRIDES};
+    let mut w = vec![vop1(0x01, 2, k(7))]; // v_mov_b32 v2, 7
+    w.push(vop2(0x1A, 15, k(2), 0)); // v_lshlrev_b32 v15, 2, v0
+    w.push(0x7D88_0000); // v_cmp_gt_u32 vcc_lo, s0, v0
+    w.push(sop1(0x3C, 12, VCC)); // s_and_saveexec_b32 s12, vcc_lo
+    w.extend(store(2, 15, 0)); // buffer_store_dword v2, v15, s[8:11], 0 offen
+    w.push(sop1(0x03, EXEC, 12)); // s_mov_b32 exec_lo, s12
+    let mut n = native_of(&w, false, 32);
+    n.layout[1].root = RootType::ResourceHeap;
+    n.used.clear();
+    let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+    let shader = lowered(&n, &p, &HashSet::new()).expect("lower");
+    assert_eq!(shader.root_uavs, [SLOT_HEAP_MARKS]);
+    assert_eq!(shader.root_srvs, [SLOT_STRIDES]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = 20; // lanes 0..19 store
+        }
+    }
+    // Ours after the constants, in slot order: the marks (u252), then the strides (t255).
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud)),
+                    (1, Root::Written(HEAP_MARKS_DWORDS)),
+                    (2, Root::View { srv: true, data: vec![4; 16] }),
+                ],
+                views: &[View::RawUav(32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let want: Vec<u32> = (0..32).map(|t| if t < 20 { 7 } else { 0 }).collect();
+    assert_eq!(out[0], want, "the stores of the lanes below s0");
+    let marks = &out[1];
+    assert_eq!(marks[0], super::shader::mark_tag(), "the mark of heap slot 0");
+    assert_ne!(marks[HEAP_MARKS_DWORDS as usize - 1], 0, "the lanes that do not store mark the sink");
+    assert!(marks[1..HEAP_MARKS_DWORDS as usize - 1].iter().all(|&m| m == 0), "no other mark");
+    eprintln!("ran: the store through the picked view landed and marked slot 0");
 }

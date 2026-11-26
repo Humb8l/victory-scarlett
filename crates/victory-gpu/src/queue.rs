@@ -500,6 +500,190 @@ thread_local! {
     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether parts that follow one another in the queues' lines go to the
+/// host as one submission (`VICTORY_JOIN_PARTS=1`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log). Off by
+/// default. Needs [`behind`].
+///
+/// Why: the title's lists wait for memory values (19 to 20 waits a frame
+/// in the first rooms, each met by the bottom-of-pipe write of the part
+/// before it), and every wait cuts a submission into parts: 29 host
+/// submissions a frame from about 15 of the title's (run 238). Each part
+/// is prepared on its own: 82 askings of the write watch, 666 refresh
+/// steps, a heap sync, a merge under the flights in the air, and on the
+/// card one list of ours that sends changed bytes and one that compares.
+/// The title hands a frame over in one burst at the end of its recording,
+/// then stands still until the line has finished it (its fence wait of
+/// the next frame: run 238), so the parts are all in the lines when our
+/// thread gets to them.
+///
+/// With the switch the thread that runs the lines takes parts off them
+/// in the order they would have run and gives them to the host together:
+/// the same host lists in the same order, prepared once. Between two
+/// parts a wait passes if memory meets it, if a write of a flight in the
+/// air is known to meet it, or if a bottom-of-pipe write of a part taken
+/// before it meets it (that part is ahead of it in the joined
+/// submission, which is the order the wait asks for). A signal met
+/// behind parts not sent yet is delivered right behind the joined
+/// submission: never before the part it followed has run. Anything else
+/// (a wait not known to be met, a present, the end of what is free to
+/// run) sends what was taken first. At most [`join_most`] parts or
+/// [`join_lists`] lists are joined, so that the card has work while the
+/// next ones are prepared. Each queue with a part taken keeps the mark
+/// [`Held::Running`] at the head of its line until the part is sent:
+/// what the title gives the queue meanwhile, signals too, stays behind.
+#[cfg(windows)]
+pub(crate) fn join_parts() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if mode != 0 {
+            tracing::info!(
+                "parts that follow one another in the queues' lines go to the host as one submission, at most {} parts or {} lists (VICTORY_JOIN_PARTS=1; alt: in turn)",
+                join_most(),
+                join_lists()
+            );
+        }
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("parts joined into one host submission from now (VICTORY_JOIN_PARTS=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
+#[cfg(windows)]
+fn join_most() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(4))
+}
+
+/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(48))
+}
+
+/// With [`join_parts`]: parts taken off the queues' lines and not yet
+/// given to the host, in the order they run.
+#[cfg(windows)]
+#[derive(Default)]
+struct Joined {
+    lists: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+    parts: usize,
+    /// Signals met behind those parts: delivered when the parts are sent.
+    signals: Vec<(usize, u64)>,
+    /// The queues with a part here: each has [`Held::Running`] at the
+    /// head of its line.
+    marked: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl Joined {
+    fn is_empty(&self) -> bool {
+        self.parts == 0
+    }
+
+    /// One more part behind those taken: its lists keep their order.
+    fn add(&mut self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        let (lists, order) = join(std::mem::take(&mut self.lists), std::mem::take(&mut self.order), lists, order);
+        self.lists = lists;
+        self.order = order;
+        self.parts += 1;
+    }
+
+    fn full(&self) -> bool {
+        self.parts >= join_most() || self.order.len() >= join_lists()
+    }
+
+    /// Whether a bottom-of-pipe write of a part taken meets `wait`.
+    fn meets(&self, wait: &crate::list::ValueWait) -> bool {
+        let (address, bytes) = wait.place();
+        self.order.iter().any(|&i| self.lists[i].host().will_write(address, bytes, |v| wait.holds_for(v)))
+    }
+}
+
+#[cfg(windows)]
+/// The things of one part behind those of another: `order` names places in
+/// `lists`, so the second part's places move up by the first's count.
+fn join<T>(mut lists: Vec<T>, mut order: Vec<usize>, more: Vec<T>, more_order: Vec<usize>) -> (Vec<T>, Vec<usize>) {
+    let base = lists.len();
+    lists.extend(more);
+    order.extend(more_order.into_iter().map(|i| i + base));
+    (lists, order)
+}
+
+/// Parts joined, host submissions they went in, their lists, signals
+/// delivered behind them, and waits passed for a write of a part taken.
+#[cfg(windows)]
+static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Gives the host what [`Joined`] holds, as one submission, delivers the
+/// signals met behind it, and takes the marks off the lines. Called with
+/// no line locked.
+#[cfg(windows)]
+fn send_joined(joined: &mut Joined) {
+    if joined.parts > 0 {
+        let (lists, order) = (std::mem::take(&mut joined.lists), std::mem::take(&mut joined.order));
+        JOINED[0].fetch_add(joined.parts as u64, Ordering::Relaxed);
+        let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
+        JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
+        if sent % 2048 == 0 {
+            let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+            tracing::info!(
+                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
+                n[0],
+                n[1],
+                n[0] as f64 / n[1].max(1) as f64,
+                n[2] as f64 / n[1].max(1) as f64,
+                n[3],
+                n[4]
+            );
+        }
+        match crate::host::host() {
+            Some(host) => host.execute_late(lists, order),
+            // (Not reached: parts are only taken with a host.)
+            None => crate::list::recycle(lists, &order),
+        }
+        joined.parts = 0;
+    }
+    // Behind what was just sent, in the order they were met.
+    for (fence, value) in joined.signals.drain(..) {
+        if !crate::host::late_signal(fence, value) {
+            crate::fence::set(fence as This, value);
+        }
+    }
+    for q in joined.marked.drain(..) {
+        // SAFETY: a live queue, as in the loop that marked it.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let mut held = lock(line);
+        if matches!(held.first(), Some(Held::Running)) {
+            held.remove(0);
+        }
+        if held.is_empty() {
+            lock(&WAITING).retain(|&w| w != q);
+        }
+    }
+}
+
 /// Before a submission of ours that is waited for, with [`behind`]: what
 /// the queues hold and is free to run runs first, on this thread, so the
 /// submission keeps its place behind them.
@@ -526,6 +710,10 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    // Parts taken and not sent yet ([`join_parts`]): none when the lines
+    // are forced, and none is left when this returns.
+    let joining = !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
+    let mut joined = Joined::default();
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -534,17 +722,34 @@ fn release_held_now(all: bool) {
             let line = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(line);
             loop {
-                match held.first() {
+                // A queue with a part in `joined` has our mark at the head
+                // of its line: what is looked at is behind the mark.
+                let base = usize::from(joined.marked.contains(&q));
+                match held.get(base) {
                     None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
+                    // With parts taken and not sent: only what is known
+                    // without a wait for the card. A wait that stays is
+                    // looked at again when the parts have been sent.
+                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
+                        if !wait.met() && !crate::host::late_met_known(wait) {
+                            if !joined.meets(wait) {
+                                break;
+                            }
+                            JOINED[4].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    // The frame is shown behind the parts taken: they are
+                    // sent first.
+                    Some(Held::Present(..)) if !joined.is_empty() => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                match held.remove(base) {
                     Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -581,6 +786,22 @@ fn release_held_now(all: bool) {
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
+                        }
+                        if joining {
+                            // Taken, to go with the parts that follow it.
+                            // The line stays open behind our mark.
+                            if !joined.marked.contains(&q) {
+                                held.insert(0, Held::Running);
+                                joined.marked.push(q);
+                            }
+                            joined.add(lists, order);
+                            if joined.full() {
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
+                            moved = true;
+                            continue;
                         }
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
@@ -653,7 +874,10 @@ fn release_held_now(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
+                        if !joined.is_empty() {
+                            // Behind parts not sent yet: with them.
+                            joined.signals.push((fence, value));
+                        } else if !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -665,7 +889,12 @@ fn release_held_now(all: bool) {
             }
         }
         if !moved {
-            break;
+            if joined.is_empty() {
+                break;
+            }
+            // Nothing more is free to run behind the parts taken: they go
+            // to the host, and what stood at a wait is looked at again.
+            send_joined(&mut joined);
         }
     }
 }
@@ -761,6 +990,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    let _site = crate::hangwatch::at(&"title call: ExecuteCommandLists (queue::execute)");
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
@@ -780,6 +1010,13 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // (P3) The recordings submitted, for the title timeline.
+        if crate::timeline::on() {
+            for &l in lists {
+                let (first, closed) = crate::list::take_stamps(l);
+                crate::timeline::submitted(first, closed);
+            }
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -870,9 +1107,13 @@ extern "system" fn signal2_x(
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+    let _site = crate::hangwatch::at(&"title call: queue Signal (queue::signal)");
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    // (P3) The first signal after a present is the title's present fence.
+    #[cfg(windows)]
+    crate::timeline::signalled(this as usize, fence as usize, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -895,6 +1136,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    let _site = crate::hangwatch::at(&"title call: queue Wait (queue::wait)");
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -1004,7 +1246,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1021,7 +1262,17 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    let _site = crate::hangwatch::at(&"title call: Present (queue::present)");
+    #[cfg(windows)]
+    crate::timeline::present_begins();
     let hr = present_now(this, planes, plane_parameters);
+    #[cfg(windows)]
+    crate::timeline::present_ends(this as usize);
+    // (F10) The frame thread, its batches outstanding, its line.
+    crate::framestream::presented();
+    // (F13) Drawables the title created this frame, sampled per present.
+    #[cfg(windows)]
+    crate::readback::models_frame();
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
@@ -1219,7 +1470,15 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
+    // (F10) Time in this call, by thread.
+    let called = std::time::Instant::now();
+    // (F3, `VICTORY_LAZY_GPU_VIEW`, meter only) The GPU view's page table.
+    let lazy = crate::gpuview::begin().map(|t| (t, std::time::Instant::now()));
+    // (F3, `VICTORY_MAP_FAST`) Ranges that follow on, as runs.
+    if crate::mapfast::on() {
+        ok = copy_page_mappings_as_runs(map, batches.into_iter().flatten(), pool, pool_pages, lazy.map(|l| l.0));
+    }
+    for b in batches.into_iter().flatten().filter(|_| !crate::mapfast::on()) {
         if b.ranges.is_null() {
             continue;
         }
@@ -1237,14 +1496,88 @@ extern "system" fn copy_page_mappings(
                 3 => true,
                 _ => false,
             };
+            if let Some((t, _)) = lazy {
+                t.note(at, r.kind, r.start, r.count);
+            }
             at += len;
         }
     }
+    if let Some((t, started)) = lazy {
+        crate::gpuview::end(t, started.elapsed().as_micros() as u64);
+    }
+    crate::framestream::mapping_call(called.elapsed().as_nanos() as u64);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// (F3, `VICTORY_MAP_FAST`) [`copy_page_mappings`]' ranges, those that
+/// follow on in destination and pool joined ([`crate::mapfast::push`]), each
+/// noted in the meter's table as it came. False if a range was refused or a
+/// mapping failed, as range by range.
+fn copy_page_mappings_as_runs<'a>(
+    map: crate::resource::PageMapper,
+    batches: impl Iterator<Item = &'a PageBatch>,
+    pool: u64,
+    pool_pages: u32,
+    table: Option<&crate::gpuview::Table>,
+) -> bool {
+    use crate::mapfast::{Count, Op, count, push};
+    let mut ops: Vec<Op> = Vec::new();
+    for b in batches {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let mut at = b.destination;
+        for r in ranges {
+            let len = u64::from(r.count) * PAGE;
+            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = pool + u64::from(r.start) * PAGE;
+            let pages = u64::from(r.count);
+            match r.kind {
+                0 if inside(r.count) => push(&mut ops, Op::Map { to: at, from: source, pages }),
+                1 if inside(1) && r.count == 1 => push(&mut ops, Op::Map { to: at, from: source, pages: 1 }),
+                1 if inside(1) => {
+                    count(Count::Repeated, 1);
+                    push(&mut ops, Op::Repeat { to: at, from: source, pages });
+                }
+                2 => push(&mut ops, Op::Unmap { to: at, pages }),
+                3 => {}
+                _ => push(&mut ops, Op::Bad),
+            }
+            if let Some(t) = table {
+                t.note(at, r.kind, r.start, r.count);
+            }
+            at += len;
+        }
+    }
+    let mut ok = true;
+    for op in ops {
+        ok &= match op {
+            Op::Map { to, from, pages } => {
+                if pages > 1 {
+                    count(Count::Runs, 1);
+                    count(Count::RunPages, pages);
+                }
+                // A run that fails as one is done page by page, as range by
+                // range: the pages before the failing one are there already
+                // and stay (`VICTORY_REMAP_SAME`), those after it are tried.
+                map(to, from, pages * PAGE)
+                    || (pages > 1 && {
+                        count(Count::PageByPage, 1);
+                        (0..pages).fold(true, |ok, k| map(to + k * PAGE, from + k * PAGE, PAGE) && ok)
+                    })
+            }
+            Op::Repeat { to, from, pages } => (0..pages).all(|k| map(to + k * PAGE, from, PAGE)),
+            Op::Unmap { to, pages } => map(to, 0, pages * PAGE),
+            Op::Bad => false,
+        };
+    }
+    ok
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1303,6 +1636,21 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn joined_parts_keep_their_lists_and_their_order() {
+        // a part of three lists run as 2, 0, 1; then one of two run as 1, 0; then one of one
+        let (lists, order) = join(vec!["a0", "a1", "a2"], vec![2, 0, 1], vec!["b0", "b1"], vec![1, 0]);
+        let (lists, order) = join(lists, order, vec!["c0"], vec![0]);
+        assert_eq!(lists, ["a0", "a1", "a2", "b0", "b1", "c0"]);
+        let run: Vec<&str> = order.iter().map(|&i| lists[i]).collect();
+        assert_eq!(run, ["a2", "a0", "a1", "b1", "b0", "c0"], "each part's lists in its own order, the parts one after the other");
+        // a part with a list named twice, and an empty one
+        let (lists, order) = join(vec!["a0"], vec![0, 0], Vec::new(), Vec::new());
+        let (lists, order) = join(lists, order, vec!["b0"], vec![0, 0]);
+        assert_eq!(order.iter().map(|&i| lists[i]).collect::<Vec<_>>(), ["a0", "a0", "b0", "b0"]);
+    }
     use crate::object::slot;
 
     /// Where a queue's signal is: newer layouts have it two slots later.

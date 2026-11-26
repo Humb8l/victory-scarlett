@@ -114,6 +114,9 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    // (P3) For the title timeline: when the title's present fence was set.
+    #[cfg(windows)]
+    crate::timeline::fence_set(this as usize, value);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {

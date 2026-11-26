@@ -44,6 +44,8 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 /// at an address of its choice), with the title's own `kind`, XMem `flags`
 /// and console `protect` (before the runtime cleans them).
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
+    // (F3) The GPU view of the streaming pool is one of these.
+    crate::gpuview::reserved(at, len, kind, flags, protect);
     if !(on() || skip_wc_back()) || at == 0 || len == 0 {
         return;
     }

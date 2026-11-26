@@ -638,6 +638,7 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
+    log_layer_pools(committed[5], present[5]);
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer
@@ -675,6 +676,81 @@ fn log_memory_map() {
         biggest.len(),
         groups.len(),
         biggest.join("; ")
+    );
+}
+
+/// With the memory map: the upload and read-back memory the layer itself
+/// holds alive, by owner and pool, against the write-combined memory the
+/// map found (`wc` committed, `wc_present` of it in memory). Upload memory
+/// is write-combined; what the map shows beyond the layer's own is not a
+/// buffer of the layer's (run dev-3-rawoff: 9-15 GB write-combined while
+/// the layer's counters said under 1 GB alive): the driver's command
+/// memory of host lists, what it keeps of released buffers, or the title's.
+/// Then the texture heaps on the card (`crate::resource` placed textures).
+fn log_layer_pools(wc: u64, wc_present: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mb = |v: u64| v >> 20;
+    let staging = crate::texture::upload_bytes();
+    let pools = crate::texture::pools();
+    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
+    let backs = [0, 1].map(|i| crate::host::READ_BACKS[i].load(Relaxed));
+    let idle = crate::list::idle_lists();
+    let upload = staging.iter().sum::<u64>() + alive[2] + alive[7];
+    tracing::info!(
+        "memory map, the layer's own upload memory alive: textures' staging {} MB in buffers of their own, {} MB in {} \
+         spare buffers (VICTORY_STAGING_POOL), {} MB in {} blocks of 64 MB with {} MB of them free (VICTORY_STAGING_BLOCKS; \
+         {} staging buffers cut from blocks, {} blocks made and {} let go since the start); host lists' scratch chunks {} MB \
+         ({} MB of them spare); lists' other upload buffers {} MB; {} idle host lists keeping {} MB of scratch, {} let go \
+         since the start (private bytes fell {} MB while they were); in all {} MB of upload memory against {} MB \
+         write-combined committed ({} MB in memory): {} MB write-combined is not the layer's buffers; read-back buffers \
+         lists hold: {} of {} MB; read-back slots of the copy-back inside flights (VICTORY_BACK_ASYNC): {} MB, at most {} MB",
+        mb(staging[0]),
+        mb(staging[1]),
+        pools[0],
+        mb(staging[2]),
+        pools[2],
+        mb(pools[3]),
+        pools[4],
+        pools[5],
+        pools[6],
+        mb(alive[2]),
+        mb(alive[4]),
+        mb(alive[7]),
+        idle[0],
+        mb(idle[1]),
+        crate::list::IDLE_LET_GO.load(Relaxed),
+        crate::list::IDLE_FREED.load(Relaxed) >> 20,
+        mb(upload),
+        mb(wc),
+        mb(wc_present),
+        mb(wc.saturating_sub(upload)),
+        backs[0],
+        mb(backs[1]),
+        mb(crate::host::back_slots_bytes()[0]),
+        mb(crate::host::back_slots_bytes()[1]),
+    );
+    let copies = crate::shadow::memory();
+    let cards = crate::shadow::card_sides();
+    tracing::info!(
+        "memory map, the layer's host copies of title memory in the PC's memory (each a duplicate of title bytes;          write-back, so among 'other private allocations' and the 4 MiB windows, not write-combined): {} copies {} MB,          of them {} windows outside buffers {} MB; of the copies, the PC's sides of card copies {} MB (as much again          in the card's memory)",
+        copies[0],
+        mb(copies[1]),
+        copies[2],
+        mb(copies[3]),
+        mb(cards),
+    );
+    let heaps = crate::resource::texture_heaps_now();
+    tracing::info!(
+        "memory map, texture heaps on the card (VICTORY_TEXTURE_HEAPS): {} of 256 MB alive, {} MB of them free (not \
+         counted as the card's use), {} placed textures waiting for their last holder; host textures made since the \
+         start: {} committed, {} placed; heaps made {}, let go as empty {}",
+        heaps[0],
+        mb(heaps[1]),
+        heaps[2],
+        heaps[3],
+        heaps[4],
+        heaps[5],
+        heaps[6],
     );
 }
 
@@ -717,13 +793,14 @@ fn log_memory() {
     let kept = crate::pipeline::kept();
     tracing::info!(
         "memory kept beside the lines below: {} shader containers {:.0} MB, {} translations \
-         {:.0} MB; the pipeline library's file {:.0} MB (its last save wrote {:.0} MB)",
+         {:.0} MB; the pipeline library's file {:.0} MB (its last save wrote {:.0} MB); {}",
         kept[0],
         mb(kept[1]),
         kept[2],
         mb(kept[3]),
         mb(kept[4]),
         mb(kept[5]),
+        crate::pipeline::library_counts_line(),
     );
     tracing::info!(
         "memory of textures: {} title textures have no host copy yet ({:.0} MB of title memory); \
@@ -977,6 +1054,12 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
         }
     };
     &mut all[at].1
+}
+
+/// (Card kinds job) The threads seen making list calls (the title's
+/// recording threads).
+pub(crate) fn recorder_ids() -> Vec<u32> {
+    RECORDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|r| r.0).collect()
 }
 
 /// A list call on this thread that began at `started` has returned.
