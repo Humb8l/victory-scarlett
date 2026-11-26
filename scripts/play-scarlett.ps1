@@ -77,6 +77,10 @@ $set = [ordered]@{
     # Draw set-up: table entries done earlier in a list are not done again; an aliased texture's copy follows its
     # source's writes within a list (a stale read in the base)
     VICTORY_TABLE_MEMO = '1'; VICTORY_LIST_ALIAS_EXACT = '1'
+
+    # Every NaN and infinity that image and buffer stores write is made 0 / +-65504 (=1 takes only the
+    # NaN an AMD card makes; an NVIDIA card's NaN went through and drew the sun black)
+    VICTORY_NAN_GUARD_STORES = '2'
 }
 if (-not $NoHooks) {
     # The memory hooks

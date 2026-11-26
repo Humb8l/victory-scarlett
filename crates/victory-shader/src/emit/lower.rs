@@ -50,10 +50,18 @@ thread_local! {
 }
 
 /// (D1) `VICTORY_NAN_GUARD_STORES` (default 0; =1: as victory-dev before D1): the NaN guard
-/// also on typed image and buffer stores, not only on float colour exports.
-fn nan_guard_stores() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD_STORES").is_some_and(|v| v == "1"))
+/// also on typed image and buffer stores, not only on float colour exports. `=1` takes only
+/// the NaN an AMD card makes (0x7FC00000) and infinities; an NVIDIA card makes 0x7FFFFFFF,
+/// which `=1` lets through. `=2`: every NaN and infinity, as on colour exports (cool_fox's
+/// `VICTORY_NAN_SCRUB`): on an RTX 5060 Ti the sun's disc was drawn black, a NaN made in a
+/// compute pass after the scene target and spread by bloom, exposure and the upscaler.
+fn nan_guard_stores() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD_STORES").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// (D1) `VICTORY_D16_BITS` (default 1; =0 as before): d16 loads and gathers through views
@@ -7770,9 +7778,11 @@ impl<'a> Lower<'a> {
         }
         // (D1) Typed stores may carry an integer's bits (a packed colour 0xFF800000 became
         // -65504.0), which the console stores as they are.
-        if !strict && !nan_guard_stores() {
-            return f;
-        }
+        let strict = match nan_guard_stores() {
+            _ if strict => true,
+            0 => return f,
+            level => level >= 2,
+        };
         let c = self.cur;
         let bits = self.as_int(f);
         let mag = self.s.m.i32(0x7FFF_FFFF);
