@@ -1,0 +1,89 @@
+HOW TO FIX THE BLACK SUN (NVIDIA cards)
+=======================================
+
+Symptom
+-------
+On an NVIDIA card (seen on an RTX 5060 Ti) the sun is drawn as a black disc,
+often with dark bands in the sky around it and dark outdoor light. AMD cards
+do not show it.
+
+
+Why it happens
+--------------
+The scene itself is right: the HDR target holds a correct white sun. Later
+passes (bloom, exposure, the temporal upscaler) are compute shaders that write
+their results to images. Near the sun a value overflows and becomes NaN
+("not a number"). The NaN is blended into the next passes and into the
+upscaler's history, and is shown as black.
+
+The layer already has a NaN guard (VICTORY_NAN_GUARD, on by default), but:
+  - it only covers the colours pixel shaders write, not image and buffer
+    stores from compute shaders (VICTORY_NAN_GUARD_STORES is off by default);
+  - with VICTORY_NAN_GUARD_STORES=1 it only recognises the NaN an AMD card
+    makes (bit pattern 0x7FC00000). An NVIDIA card makes 0x7FFFFFFF, which
+    is let through. That is why the sun stays black on NVIDIA.
+
+
+The fix
+-------
+A third level, VICTORY_NAN_GUARD_STORES=2, treats image and buffer stores
+like colour exports: every NaN becomes 0 and every infinity becomes
++-65504. It does the same job as cool_fox's VICTORY_NAN_SCRUB=1, which fixed
+the same sun.
+
+It is on branch nvidia-black-sun of https://github.com/Humb8l/victory-scarlett
+(commit 8c0e91e). Play-Scarlett.cmd on that branch already sets it.
+
+
+Steps
+-----
+1. Get the branch:
+
+     git clone https://github.com/Humb8l/victory-scarlett
+     cd victory-scarlett
+     git checkout nvidia-black-sun
+
+   (Already have a clone of Op-lite/victory-scarlett? Then:
+     git remote add humb8l https://github.com/Humb8l/victory-scarlett
+     git fetch humb8l
+     git checkout -b nvidia-black-sun humb8l/nvidia-black-sun )
+
+2. Build:
+
+     cargo build --profile diag -p victory --features diagnostics --locked
+
+3. Start as usual with Play-Scarlett.cmd (or scripts\play-scarlett.ps1).
+   It sets VICTORY_NAN_GUARD_STORES=2 for you.
+
+   With your own launcher instead, set the variable before the start:
+
+     $env:VICTORY_NAN_GUARD_STORES = '2'
+
+   Setting the variable alone is NOT enough on the unpatched code: there,
+   only the value 1 is read, and 1 does not catch an NVIDIA card's NaN.
+
+4. The first start after the change is slower: the shader cache is keyed on
+   this setting, so the shaders are translated again once.
+
+
+Known side effect
+-----------------
+A few passes store integer data through float-typed image or buffer stores.
+If such data happens to look like a NaN or an infinity, it is changed too
+(the layer's own notes saw a packed colour 0xFF800000 become -65504). If a
+surface shows wrong colours after the change, start once with
+-More @{ VICTORY_NAN_GUARD_STORES = '1' } to compare.
+
+
+On cool_fox
+-----------
+cool_fox has its own switch for the same fix: VICTORY_NAN_SCRUB=1. Its
+launcher Play-DLSS.ps1 turns it on.
+
+
+Not the cause
+-------------
+- The R9G9B9E5 render target stand-in: a 32-bit float stand-in
+  (VICTORY_E5_STAND_IN=32 in cool_fox) did not fix the sun.
+- The purple glow on bushes and trees is a separate problem: it comes from
+  ray tracing being off (VICTORY_BVH_BUILDER=1 fixes it, at a high cost).
