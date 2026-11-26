@@ -13,7 +13,10 @@
 # -RayTracing  the title's own ray tracing (VICTORY_BVH_BUILDER=1): better light, much slower. Off by default.
 # -AutoStart   presses through the start screens by itself, for a fresh start with no save
 # -NoHooks     without the memory hooks: the first thing to try if something looks wrong
-# -More        other settings, last word: -More @{ VICTORY_LOG = 'warn' }
+# -CardSteps   0, 1 or 2 (default 2): which steps that read memory still in flight are done on the card.
+#              2 also does the title's buffer copies there; the skinning passes write that memory and
+#              earlier reviews saw bodies stretch with it. 1 is the first thing to try if meshes stretch.
+# -More       other settings, last word: -More @{ VICTORY_LOG = 'warn' }
 #
 # Run it from a normal window, not as administrator.
 param(
@@ -25,6 +28,7 @@ param(
     [switch]$RayTracing,
     [switch]$AutoStart,
     [switch]$NoHooks,
+    [ValidateSet('0', '1', '2')][string]$CardSteps = '2',
     [hashtable]$More = @{}
 )
 $ErrorActionPreference = 'Stop'
@@ -86,6 +90,7 @@ if (-not $NoHooks) {
     # The memory hooks
     $set.VICTORY_GPU_ONLY = '1'; $set.VICTORY_KNOWN_WRITES = '1'
 }
+$set.VICTORY_CARD_STEPS = $CardSteps
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
 if ($AutoStart) {
     $set.VICTORY_AUTO_INPUT = 'd>=15,rep(A,1,d<10),w3,d>=20,w1,rep(A,1,d>=35),w1.5,Down,w7,Down,w0.6,A,w1.5,A,w0.7,Down,w0.5,A,w0.7,Down,w0.5,A'
@@ -93,6 +98,15 @@ if ($AutoStart) {
 foreach ($k in $More.Keys) { $set[$k] = [string]$More[$k] }
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }
 
+# The layer's remapping slows to about twice its time per call when free RAM runs low (fox-port-C: 1.7 GB free in
+# the long frames, 4.1 GB in the others); a 32 GB PC has little to spare beside a ~33 GB commit peak.
+$os = Get-CimInstance Win32_OperatingSystem
+$freeGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+if ($freeGB -lt 16) {
+    Write-Warning "Only $freeGB GB of RAM free: long frames get more likely. The largest other programs:"
+    Get-Process | Where-Object { $_.Name -ne 'victory' } | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 5 |
+        ForEach-Object { Write-Warning ("  {0}: {1:N1} GB" -f $_.Name, ($_.PrivateMemorySize64 / 1GB)) }
+}
 Write-Host ("Series X mode, {0} build, ray tracing {1}, memory hooks {2}" -f $Build, $(if ($RayTracing) { 'on' } else { 'off' }), $(if ($NoHooks) { 'off' } else { 'on' }))
 Write-Host "Cache: $Cache"
 Write-Host "Saves: $Data"
