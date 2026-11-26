@@ -57,6 +57,11 @@ impl Object {
             refs: AtomicU32::new(0),
         }
     }
+
+    /// The object's function table (what kind of object it is).
+    pub(crate) fn table(&self) -> *const *const () {
+        self.functions
+    }
 }
 
 pub(crate) type This = *const Object;

@@ -34,6 +34,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod chunks; // (fox port A) F21 arena chunk meter (VICTORY_CHUNK_METER)

@@ -1758,6 +1758,13 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// Host work the title does not know of (a PC library recorded onto the
+    /// list, `crate::external`) has run: it set its own heaps, root signature
+    /// and pipeline, so the title's state is set again as for a new list.
+    pub(crate) fn after_external(&mut self, list: &HostList) {
+        self.replay(list);
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];

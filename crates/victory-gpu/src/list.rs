@@ -186,6 +186,37 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// Whether `this` is one of our command lists (by its function table).
+#[cfg(windows)]
+pub(crate) fn is_list(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: a title object's first word is its table; only read.
+    let table = unsafe { (*this).table() };
+    table == LIST_FUNCTIONS.0.as_ptr()
+        || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+        || table == THIN_FUNCTIONS.0.as_ptr()
+        || table == NEWER_THIN_FUNCTIONS.0.as_ptr()
+}
+
+/// Runs `f` with the host list behind `this` and the draw state the title
+/// set on it; `false` if `this` has no host list. A list whose calls are
+/// written down for other threads (`VICTORY_THIN=1`) has none yet: a PC
+/// library cannot record onto it here (from Neptune, without its
+/// `thin::caught_up`; run such libraries with `VICTORY_THIN=0`).
+#[cfg(windows)]
+pub(crate) fn with_host(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) -> bool {
+    if !is_list(this) || host_list(this).is_none() {
+        return false;
+    }
+    with_state(this, f);
+    true
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 /// (Fox T, `VICTORY_PASS_TIMES`) A title list method that is not a draw or a
