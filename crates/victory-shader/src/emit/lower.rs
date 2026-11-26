@@ -55,11 +55,16 @@ thread_local! {
 /// which `=1` lets through. `=2`: every NaN and infinity, as on colour exports (cool_fox's
 /// `VICTORY_NAN_SCRUB`): on an RTX 5060 Ti the sun's disc was drawn black, a NaN made in a
 /// compute pass after the scene target and spread by bloom, exposure and the upscaler.
+/// `=3`: as `=2`, and an infinity becomes 0 too, on stores and colour exports alike, as
+/// cool_fox's scrub does: `=2` writes +-65504, the largest 16-bit float, which the next pass
+/// can carry past the 16-bit range again (an infinity, then inf - inf = NaN); `=2` left the
+/// sun black in Series X on an RTX 5060 Ti.
 fn nan_guard_stores() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD_STORES").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
@@ -7852,7 +7857,8 @@ impl<'a> Lower<'a> {
         }
         // (D1) Typed stores may carry an integer's bits (a packed colour 0xFF800000 became
         // -65504.0), which the console stores as they are.
-        let strict = match nan_guard_stores() {
+        let level = nan_guard_stores();
+        let strict = match level {
             _ if strict => true,
             0 => return f,
             level => level >= 2,
@@ -7871,9 +7877,14 @@ impl<'a> Lower<'a> {
         let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
         let sign_bit = self.s.m.i32(0x8000_0000);
         let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
-        let big = self.s.m.i32(65504f32.to_bits());
-        let big = self.s.m.bin(c, Bin::Or, sign, big);
         let zero = self.s.m.i32(0);
+        // (`VICTORY_NAN_GUARD_STORES=3`) an infinity is 0, as a NaN
+        let big = if level >= 3 {
+            zero
+        } else {
+            let big = self.s.m.i32(65504f32.to_bits());
+            self.s.m.bin(c, Bin::Or, sign, big)
+        };
         let r = self.s.m.select(c, inf, big, bits);
         let r = self.s.m.select(c, nan, zero, r);
         self.as_float(r)
