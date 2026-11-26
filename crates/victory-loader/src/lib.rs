@@ -26,6 +26,10 @@ pub mod callhook;
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+// VICTORY_RENDER_SCALE / VICTORY_OWN_UPSCALER / VICTORY_NO_WATCHDOG title
+// patches (from trustno1-coder/VIctory-NVIDIA).
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
