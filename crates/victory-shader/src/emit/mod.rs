@@ -243,6 +243,34 @@ pub fn nan_origin(code: &[u8]) -> Option<u32> {
     tags.iter().position(|&t| t == tag).map(|i| i as u32)
 }
 
+/// `VICTORY_NAN_FILL=<tag>:<value>[,<tag>:<value>...]` (default none): in the programs with
+/// those tags (as the NaN meter prints them, [`code_tag`]) a NaN that a typed image or buffer
+/// store or a float colour export writes becomes `value`, before the NaN guard. The guard's
+/// 0 is the wrong stand-in where 0 means something: in the screen-space ambient occlusion
+/// (`CS_ScreenSpaceBentConesCheckerboard`, a 0 x inf of an empty neighbour entry) 0 is "fully
+/// occluded", drawn as black patches indoors, and 1 is "not occluded". A translation switch:
+/// the shader cache keys on it.
+pub fn nan_fill(code: &[u8]) -> Option<f32> {
+    static FILLS: std::sync::OnceLock<Vec<(u64, f32)>> = std::sync::OnceLock::new();
+    let fills = FILLS.get_or_init(|| {
+        std::env::var("VICTORY_NAN_FILL")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|pair| {
+                let (tag, value) = pair.split_once(':')?;
+                let tag = u64::from_str_radix(tag.trim().trim_start_matches("0x"), 16).ok()?;
+                let value: f32 = value.trim().parse().ok()?;
+                value.is_finite().then_some((tag, value))
+            })
+            .collect()
+    });
+    if fills.is_empty() {
+        return None;
+    }
+    let tag = code_tag(code);
+    fills.iter().find(|&&(t, _)| t == tag).map(|&(_, v)| v)
+}
+
 /// (Fox T) `VICTORY_PROBE_RAYS=1` (default off): with the ray-tracing structure builder off,
 /// the title's screen probes still trace their rays (`CS_ScreenProbes_ActivateRays` runs, so
 /// no probe keeps the stale memory that showed as violet vegetation), and every node test

@@ -7851,6 +7851,21 @@ impl<'a> Lower<'a> {
     }
 
     fn nan_guard(&mut self, f: V, strict: bool) -> V {
+        // (`VICTORY_NAN_FILL`) this program's own stand-in for a NaN, before the guard
+        let f = match super::nan_fill(&self.x.native.code) {
+            Some(fill) => {
+                let c = self.cur;
+                let bits = self.as_int(f);
+                let mag = self.s.m.i32(0x7FFF_FFFF);
+                let abs = self.s.m.bin(c, Bin::And, bits, mag);
+                let inf_bits = self.s.m.i32(0x7F80_0000);
+                let nan = self.s.m.cmp(c, pred::IUGT, abs, inf_bits);
+                let fill = self.s.m.i32(fill.to_bits());
+                let r = self.s.m.select(c, nan, fill, bits);
+                self.as_float(r)
+            }
+            None => f,
+        };
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
             return f;
