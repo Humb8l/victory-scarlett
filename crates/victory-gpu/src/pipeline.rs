@@ -318,6 +318,26 @@ pub(crate) fn label(this: This) -> Arc<str> {
     p.host.label(p.builder)
 }
 
+/// (`VICTORY_NAN_METER`) The tags of the title pipeline `this`'s programs (FNV-1a of each
+/// one's console code, [`victory_shader::emit::code_tag`]), the names `VICTORY_NAN_ORIGIN`
+/// takes: the meter lines print them beside the programs' names.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn code_tags(this: This) -> String {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return String::new();
+    }
+    let mut tags = Vec::new();
+    for shader in &pipeline(this).shaders {
+        let Ok(c) = Container::parse(&shader.container) else { continue };
+        let Some(part) = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) else { continue };
+        for native in victory_shader::native_programs(part.data).unwrap_or_default() {
+            tags.push(format!("{:x}", victory_shader::emit::code_tag(&native.code)));
+        }
+    }
+    tags.join(",")
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

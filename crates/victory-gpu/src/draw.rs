@@ -1973,7 +1973,11 @@ impl State {
         // (Fox T, `VICTORY_NAN_METER`) The program's place in the counts.
         if kind == victory_shader::emit::USER_NAN_SLOT {
             #[cfg(feature = "diagnostics")]
-            return crate::nanmeter::slot(self.pipeline, || crate::pipeline::label(self.pipeline as This));
+            return crate::nanmeter::slot(self.pipeline, || {
+                // the program tags `VICTORY_NAN_ORIGIN` takes, beside the names
+                let this = self.pipeline as This;
+                std::sync::Arc::from(format!("{} [tag {}]", crate::pipeline::label(this), crate::pipeline::code_tags(this)))
+            });
             #[cfg(not(feature = "diagnostics"))]
             return 0;
         }
