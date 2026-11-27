@@ -155,6 +155,15 @@ $set = [ordered]@{
     # gave it last frame's)
     VICTORY_PLANE_NOW = '1'
 
+    # Freezes: the views of the title's batch page-mapping copies are mapped only when touched
+    VICTORY_SOFT_VIEWS = 'copies'
+
+    # Picture: pipelines with static samplers are made each run, not loaded from the saved library
+    VICTORY_SAMPLERS_MADE = '1'
+
+    # Draw set-up: only the table slots a program can read; texture-queue notes that change nothing skip its lock
+    VICTORY_TABLE_NAMED_ONLY = '1'; VICTORY_QUEUE_MARKS = '1'
+
     # Every NaN and infinity that image and buffer stores write is made 0 / +-65504 (=1 takes only the
     # NaN an AMD card makes; an NVIDIA card's NaN went through and drew the sun black)
     VICTORY_NAN_GUARD_STORES = '2'
